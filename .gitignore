@@ -25,11 +25,16 @@ venv/
 env/
 .env
 
-# MSVC compiler intermediate build artifacts
+# MSVC and GCC compiler intermediate build artifacts
 *.obj
+*.o
 *.exp
 *.ilk
 *.pdb
+build/
+cpp_recorder/tests_output/
+cpp_recorder/bin/tests/
+cpp_recorder/bin/imgui.ini
 
 # Editor and OS files
 .vscode/

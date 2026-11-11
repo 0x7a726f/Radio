@@ -370,6 +370,14 @@ def main():
         help="Path to the raw CS16 I/Q recording file. If omitted, launches interactive wizard.",
     )
     parser.add_argument(
+        "--file",
+        "-f",
+        dest="file_opt",
+        type=str,
+        default=None,
+        help="Path to the raw CS16 I/Q recording file (alias for positional argument).",
+    )
+    parser.add_argument(
         "--fc",
         "--center-freq",
         dest="center_freq",
@@ -428,10 +436,11 @@ def main():
     args = parser.parse_args()
 
     # If no file is provided via CLI and stdin is a TTY, launch interactive wizard
-    if args.file is None:
+    input_file = args.file if args.file is not None else args.file_opt
+    if input_file is None:
         filepath, config = interactive_wizard()
     else:
-        filepath = args.file.strip('"').strip("'")
+        filepath = input_file.strip('"').strip("'")
         if not os.path.exists(filepath):
             # Check if it's relative to workspace
             parent_dir = os.path.abspath(os.path.join(current_dir, ".."))

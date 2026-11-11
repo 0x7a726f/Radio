@@ -10,7 +10,17 @@ Built specifically for amateur and professional radio astronomers using SDR rece
 
 ```text
 Radio/
-├── Recorder/                        # SatDump-Style Live SDR Receiver & CS16 Capture App
+├── cpp_recorder/                    # High-Performance C++ Live SDR Receiver & CS16 Capture (SatDump UI & SIMD)
+│   ├── bin/                         # Standalone binaries (sdr_recorder_gui.exe, sdr_recorder_cli.exe, DLLs)
+│   ├── include/                     # Headers (simd_dsp.h, lockfree_ringbuffer.h, sdr_controller.h, app_gui.h...)
+│   ├── src/                         # Implementations (sdr_controller.cpp, dsp_pipeline.cpp, app_gui.cpp...)
+│   ├── tests/                       # Automated test harness & 27 unit tests (run_tests.bat)
+│   ├── CMakeLists.txt               # CMake configuration
+│   ├── build_mingw.bat              # 1-click build script (MinGW GCC 16.2.0 -O3 -mavx2)
+│   ├── build_msvc.bat               # 1-click build script (MSVC)
+│   └── README.md                    # Detailed C++ architecture & build documentation
+│
+├── Recorder/                        # Python Live SDR Receiver & CS16 Capture App
 │   ├── app.py                       # Desktop GUI (Device, FFT controls, Recording, Waterfall)
 │   ├── sdr_stream.py                # Hardware RTL-SDR driver via ctypes (with Virtual SDR fallback)
 │   ├── cs16_writer.py               # Asynchronous high-speed CS16 binary stream recorder

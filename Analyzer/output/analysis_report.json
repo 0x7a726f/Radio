@@ -1,11 +1,11 @@
 {
   "metadata": {
-    "source_file": "SatDump/Astro/file5.cs16",
-    "filesize_bytes": 5004954624,
-    "total_samples": 1251238656,
-    "duration_seconds": 521.34944,
-    "processing_time_seconds": 33.41274749999866,
-    "throughput_mb_s": 142.85256486877327
+    "source_file": "recordings/valid_hi.cs16",
+    "filesize_bytes": 47710208,
+    "total_samples": 11927552,
+    "duration_seconds": 4.969813333333334,
+    "processing_time_seconds": 0.20581879996461794,
+    "throughput_mb_s": 221.06824064576148
   },
   "sdr_settings": {
     "center_frequency_hz": 1420500000.0,
@@ -21,17 +21,17 @@
   "hydrogen_line_detection": {
     "target_line": "Neutral Hydrogen (H I 21cm, 1S F=1 -> F=0)",
     "rest_frequency_mhz": 1420.4057517679998,
-    "observed_peak_frequency_mhz": 1420.4794921875,
-    "doppler_recession_velocity_kms": -15.563737043709645,
-    "peak_antenna_temperature_k": 0.7467313284188037,
-    "peak_power_above_baseline_db": 0.032309645991606344,
-    "noise_floor_rms_k": 0.2621892670742318,
-    "noise_floor_rms_db": 0.011378657143864435,
-    "signal_to_noise_ratio_snr": 2.8480621527783097,
-    "line_fwhm_kms": 18.776987125794808,
-    "velocity_dispersion_sigma_kms": 7.973852407315552,
-    "integrated_flux_k_kms": 1.2720004363028254,
-    "neutral_hydrogen_column_density_cm2": 2.318093595118269e+18,
+    "observed_peak_frequency_mhz": 1420.3921875,
+    "doppler_recession_velocity_kms": 2.862889874668149,
+    "peak_antenna_temperature_k": 4.104064838616583,
+    "peak_power_above_baseline_db": 0.17467687267653895,
+    "noise_floor_rms_k": 2.5976618574393253,
+    "noise_floor_rms_db": 0.1126291306607551,
+    "signal_to_noise_ratio_snr": 1.579907264243473,
+    "line_fwhm_kms": 2.7061587741992543,
+    "velocity_dispersion_sigma_kms": 1.1491998429600794,
+    "integrated_flux_k_kms": 4.555424322043382,
+    "neutral_hydrogen_column_density_cm2": 8.301805284491859e+18,
     "lo_dc_offset_khz": 94.24823200011254,
     "bins_from_dc_to_hi": 322
   }
