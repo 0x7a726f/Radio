@@ -103,7 +103,7 @@ def interactive_wizard() -> Tuple[str, AstroConfig]:
     print("      ASTRO - RADIO TELESCOPE HYDROGEN LINE ANALYSIS WIZARD")
     print("=" * 70)
     
-    # Search for cs16 files in parent directory (E:\Code\Radio)
+    # Search for cs16 files in parent directory (workspace)
     parent_dir = os.path.abspath(os.path.join(current_dir, ".."))
     discovered = find_cs16_files(parent_dir)
     

@@ -1,29 +1,33 @@
 # Radio
 
-A collection of high-performance Software-Defined Radio (SDR) and Digital Signal Processing (DSP) applications, covering terrestrial digital television broadcast reception and radio astronomy observational pipelines.
+A high-performance Software-Defined Radio (SDR) and Digital Signal Processing (DSP) observational pipeline for **21cm Neutral Hydrogen (H I) Line** radio astronomy ($\sim 1420.40575\text{ MHz}$).
+
+Optimized for high-throughput streaming analysis of raw complex signed 16-bit integer (**CS16**) I/Q observations collected with amateur and professional radio telescopes using SDR receivers (e.g., RTL-SDR Blog V4/V3, Airspy, HackRF, SDRplay).
 
 ---
 
-## Projects Overview
+## Key Features
 
-### 1. [TV: Greek Television and Radio SDR Live Tuner](./TV)
-
-A real-time SDR terrestrial digital television tuner and public broadcaster player optimized for the RTL-SDR Blog V4 (and compatible receivers) with fallback RF simulation.
-
-- **C++ SIMD Demodulator (`tv_demod.dll`)**: AVX2-accelerated Radix-2 Cooley-Tukey FFT and PSD computing over 690,000 spectral queries per second (~1.4 microseconds per query), with built-in DVB-T/COFDM carrier analysis, WFM/AM demodulators, and Windows WaveOut soundcard output.
-- **Native Desktop Application (`tv_app.exe`)**: Standalone Win32 double-buffered desktop app rendering real-time RF spectrum and 2D rolling waterfall at 30–60 FPS with instant response and zero browser overhead.
-- **Native Video & Audio Playback**: Plays live station streams natively without web browser dependency, supporting direct VLC (`--one-instance`) and in-window embedded playback (`tv_desktop_app.py`) via `libvlc`.
-- **Pre-configured Station Directory & Frequency Maps**: Covers national Greek broadcasters (ERT 1, ERT 2, ERT 3, ERT News, Parliament TV, ERT Cosmos, Star Channel, Naftemporiki TV, regional stations, and ERT public radio) across primary regional transmitters (Athens/Attica, Central Macedonia, Western Greece, Thessaly, Crete, and Epirus).
-- **Portable & Self-Contained**: Statically linked CRT (`/MT`) with bundled `rtlsdr.dll` and `libusb-1.0.dll` for immediate execution via `launch.bat` on any Windows system.
-
-### 2. [Astro: 21cm Neutral Hydrogen (H I) Radio Astronomy Pipeline](./Astro)
-
-A high-throughput radio astronomy pipeline engineered to process raw CS16 (complex signed 16-bit integer I/Q) radio telescope observations centered around the 21cm Neutral Hydrogen line (~1420.40575 MHz).
-
-- **Streaming DSP Engine**: Chunked streaming architecture processing multi-gigabyte recordings at >100–180 MB/s while maintaining memory consumption strictly under 100 MB RAM.
-- **Instrumental Correction**: Smooth excision of central LO leakage and DC spikes, coupled with advanced two-stage baseline modeling (adaptive Whittaker smoothing and Chebyshev polynomials) to eliminate coaxial cable standing wave reflections (~700 kHz ripples).
-- **Astrophysical Analysis**: Topocentric Doppler velocity calculations, non-linear Gaussian line profile fitting (FWHM, velocity dispersion, peak velocity), integrated flux integration, and total column density ($N_{HI}$) determination.
-- **Automated Output**: Generates calibrated spectra, time-frequency waterfalls proving signal continuity and RFI absence, multi-panel observation dashboards, CSV exports, and structured JSON/text reports.
+- **Blazing Fast Multithreaded Streaming Engine**:
+  - Leverages multithreaded `scipy.fft` with zero-copy NumPy buffers.
+  - Processes multi-gigabyte recordings at **> 100–180 MB/s** (25–45 MSamples/s), completing typical multi-minute observations in seconds.
+  - Streamed chunk-based I/O keeps RAM consumption strictly under **100 MB** regardless of recording size.
+- **Off-Center DC Offset Combating**:
+  - Direct conversion / Zero-IF SDRs suffer from central Local Oscillator (LO) leakage spikes.
+  - Full support for off-center tuning (e.g., `--fc 1420.5MHz` for a 2.4 MSPS RTL-SDR passband).
+  - The pipeline automatically detects the LO offset, validates separation from the H I rest line, and smoothly excises the residual DC spike.
+- **Advanced Two-Stage Baseline Modeling (Combats Coaxial Standing Waves)**:
+  - Radio telescope front-ends suffer from $\sim 700\text{ kHz}$ sinusoidal standing wave ripples caused by impedance reflections between the LNA and SDR coaxial cable.
+  - **Stage 1 (Passband Harmonic Fit)**: Adaptive Whittaker smoothing (ALS) or iterative Chebyshev polynomials fit the standing wave across the passband in log-space while downweighting digital filter skirts (outer 6.5%) and protecting the narrow H I window.
+  - **Stage 2 (Local Astronomical Zeroing)**: Performs local baseline detrending using line-free reference channels ($|v| > 40\text{ km/s}$), guaranteeing an exact **$0.000\text{ K}$ / $0.000\text{ dB}$ flat baseline** beneath the line with noise floor $\sigma \approx 0.5\text{ K}$.
+- **Kinematic & Physical Analysis**:
+  - Topocentric Doppler radial velocity mapping ($v = c \cdot \frac{f_0 - f}{f_0}$).
+  - Non-linear Gaussian emission profile fitting to extract peak velocity ($v_\text{peak}$), FWHM ($\Delta v_\text{FWHM}$), and velocity dispersion ($\sigma_v$).
+  - Integrated flux ($W = \int T_A dv$) and neutral hydrogen column density determination ($N_{HI} = 1.8224 \times 10^{18} W\text{ atoms/cm}^2$).
+- **Publication-Grade Visualizations**:
+  - Generates publication-ready figures including calibrated dual-axis spectra, raw bandpass vs. baseline models, Doppler velocity profiles, time-frequency waterfall spectrograms, and unified 4-panel executive dashboards.
+- **Multi-Format Structured Exports**:
+  - Calibrated CSV data tables, human-readable summary text reports, and machine-readable JSON metrics.
 
 ---
 
@@ -31,58 +35,113 @@ A high-throughput radio astronomy pipeline engineered to process raw CS16 (compl
 
 ```text
 Radio/
-├── Astro/                   # 21cm Neutral Hydrogen Line Radio Astronomy Pipeline
-│   ├── astro_analyzer.py    # Core analysis runner & CLI
-│   ├── config.py            # Astronomy pipeline configuration & physical constants
-│   ├── dsp.py               # Multithreaded streaming FFT, PSD, & baseline fitting
-│   ├── exporter.py          # Data export (CSV, JSON, ASCII reports)
-│   ├── run.py               # Interactive CLI wizard
-│   ├── visualizer.py        # Spectral plots, waterfalls, and observation dashboard
-│   ├── output/              # Sample observation reports and visualizations
-│   └── README.md            # Detailed astronomy pipeline documentation
+├── Astro/                           # 21cm Neutral Hydrogen Line Radio Astronomy Pipeline
+│   ├── astro_analyzer.py            # Core analysis runner & CLI engine
+│   ├── config.py                    # Astronomy pipeline configuration & physical constants
+│   ├── dsp.py                       # Multithreaded streaming FFT, PSD, & baseline fitting
+│   ├── exporter.py                  # Data export (CSV, JSON, ASCII reports)
+│   ├── run.py                       # Interactive CLI wizard launcher
+│   ├── visualizer.py                # Spectral plots, waterfalls, and observation dashboard
+│   ├── output/                      # Sample observation reports and visualizations
+│   │   ├── 1_hi_spectrum_calibrated.png
+│   │   ├── 2_hi_raw_and_baseline.png
+│   │   ├── 3_hi_doppler_velocity.png
+│   │   ├── 4_hi_waterfall_time_frequency.png
+│   │   ├── 5_hi_master_dashboard.png
+│   │   ├── analysis_report.json
+│   │   ├── analysis_report.txt
+│   │   └── calibrated_spectrum.csv
+│   └── README.md                    # Detailed astronomy pipeline documentation
 │
-├── TV/                      # Greek TV & Radio SDR Live Tuner & Native Desktop App
-│   ├── cpp/                 # C++ Source Code & MSVC Build Tools
-│   │   ├── build.bat        # Portable compiler script (/MT /arch:AVX2 /O2)
-│   │   ├── tv_app.cpp       # Native Win32 desktop GUI application
-│   │   ├── tv_demod.cpp     # AVX2 FFT, DVB-T analyzer, WFM/AM demod engine
-│   │   └── tv_demod.h       # C++ Demodulator API header
-│   ├── tv_app.exe           # Standalone native desktop executable (/MT)
-│   ├── tv_demod.dll         # High-speed AVX2 SIMD demodulator dynamic library
-│   ├── rtlsdr.dll           # Bundled RTL-SDR hardware driver
-│   ├── libusb-1.0.dll       # Bundled USB backend library
-│   ├── tv_desktop_app.py    # Python desktop application with embedded VLC video
-│   ├── launch.bat           # One-click portable desktop launcher
-│   ├── run.py               # Multi-mode launcher (--native, --pyapp, --web)
-│   ├── channels.py          # Greek channel multiplex definitions & frequencies
-│   ├── channels.m3u8        # Exported station playlist
-│   ├── sdr_receiver.py      # Python RTL-SDR interface with RF simulation fallback
-│   ├── dsp.py               # Python fallback DSP & DVB-T metric computation
-│   └── README.md            # Comprehensive TV tuner architecture documentation
-│
-└── .gitignore               # Git rules ignoring local SDR installations & large recordings
+└── .gitignore                       # Git rules ignoring local SDR suites & large recordings
 ```
 
 ---
 
 ## Quick Start
 
-### Running the TV Desktop Tuner
-1. Navigate to the `TV` directory:
-   ```cmd
-   cd TV
-   ```
-2. Double-click `launch.bat` or run:
-   ```cmd
-   tv_app.exe
-   ```
+### Prerequisites
 
-### Running the Radio Astronomy Pipeline
-1. Navigate to the `Astro` directory:
-   ```cmd
-   cd Astro
-   ```
-2. Launch the interactive analysis wizard:
-   ```cmd
-   python run.py
-   ```
+Ensure you have Python 3.8+ installed with the following packages:
+
+```bash
+pip install numpy scipy matplotlib
+```
+
+### 1. Interactive Mode (Wizard)
+
+Run the wizard launcher directly without arguments:
+
+```bash
+python Astro/run.py
+```
+
+The interactive wizard will:
+1. Scan the repository workspace for available `.cs16` recordings.
+2. Prompt for your SDR Center LO frequency (default: `1420.5 MHz`).
+3. Prompt for SDR Sample Rate (default: `2.4 MSPS`, ideal for standard RTL-SDR bandwidth).
+4. Prompt for analysis duration (e.g. 120 seconds or full observation).
+
+---
+
+### 2. Command-Line (CLI) Mode
+
+Run non-interactively with CLI arguments:
+
+```bash
+python Astro/astro_analyzer.py <path_to_file.cs16> [options]
+```
+
+#### Example Commands
+
+- **Analyze a 2.4 MSPS RTL-SDR recording centered at 1420.5 MHz**:
+  ```bash
+  python Astro/astro_analyzer.py observation.cs16 --fc 1420.5MHz --fs 2.4MSPS
+  ```
+
+- **Process the first 2 minutes (120 seconds) of an observation**:
+  ```bash
+  python Astro/astro_analyzer.py observation.cs16 --fc 1420.5MHz --fs 2.4MSPS --duration 120
+  ```
+
+- **Use Asymmetric Least Squares (ALS) baseline modeling**:
+  ```bash
+  python Astro/astro_analyzer.py observation.cs16 --fc 1420.5MHz --baseline als
+  ```
+
+- **High-resolution 16384-channel FFT**:
+  ```bash
+  python Astro/astro_analyzer.py observation.cs16 --fc 1420.5MHz --fft-size 16384
+  ```
+
+---
+
+## Command-Line Arguments Reference
+
+| Option | Flag | Description | Default |
+| :--- | :--- | :--- | :--- |
+| `file` | Positional | Path to the raw CS16 file | Interactive Wizard |
+| `--fc` | `--center-freq` | SDR center LO frequency (`1420.5`, `1420.5MHz`, etc.) | `1420.5 MHz` |
+| `--fs` | `--sample-rate` | SDR sampling rate (`2.4`, `2.4MSPS`, `2400000`, etc.) | `2.4 MSPS` |
+| `-n` | `--fft-size` | Number of FFT bins (frequency channels) | `8192` |
+| `-t` | `--duration` | Seconds to process (omit to process entire recording) | Full file |
+| `--baseline` | | Baseline fit algorithm (`ripple_filter`, `als`, `poly`) | `ripple_filter` |
+| `--tsys` | | System noise temperature in Kelvin for $T_A$ scaling | `100.0 K` |
+| `-o` | `--output-dir`| Custom directory to save output plots and reports | `Astro/output` |
+
+---
+
+## Output Artifacts
+
+Upon completion, all generated plots and data files are saved into `Astro/output/`:
+
+| Filename | Description |
+| :--- | :--- |
+| `1_hi_spectrum_calibrated.png` | Primary calibrated Hydrogen Line spectrum (velocity & frequency axes, Gaussian fit, HUD card) |
+| `2_hi_raw_and_baseline.png` | Raw SDR bandpass, baseline curve, DC spike excision marker, and protected bandpass zone |
+| `3_hi_doppler_velocity.png` | Doppler radial velocity profile showing galactic kinematics |
+| `4_hi_waterfall_time_frequency.png` | Time-frequency waterfall spectrogram demonstrating signal stability |
+| `5_hi_master_dashboard.png` | Unified 4-panel executive observation dashboard |
+| `calibrated_spectrum.csv` | Full CSV dataset of frequency, velocity, raw dB, baseline dB, calibrated dB, and Antenna Temp (K) |
+| `analysis_report.txt` | Human-readable scientific summary report |
+| `analysis_report.json` | Machine-readable JSON metrics and metadata |

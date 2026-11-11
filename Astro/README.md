@@ -48,7 +48,7 @@ cd Astro
 python run.py
 ```
 The wizard will:
-1. Scan `E:\Code\Radio` for available `.cs16` files and let you select one.
+1. Scan the repository workspace for available `.cs16` files and let you select one.
 2. Prompt for your SDR Center LO frequency (default: `1420.5 MHz`).
 3. Prompt for Sample Rate (default: `2.4 MSPS`).
 4. Prompt for analysis duration (e.g. 120 seconds or full observation).
