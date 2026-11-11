@@ -584,7 +584,7 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
         SetTextColor(memDC, statusCol);
         char badgeTxt[128];
         if (m.is_hardware) sprintf_s(badgeTxt, "Hardware: Active (%s)", m.status_message);
-        else sprintf_s(badgeTxt, "Source: Fallback Mode (%s)", m.sdr_status == SDR_STATUS_BUSY ? "Busy" : "Simulation");
+        else sprintf_s(badgeTxt, "Fallback Mode (%s - Click to Reconnect)", m.sdr_status == SDR_STATUS_BUSY ? "Busy" : "Simulation");
         RECT bTextR = { 24, status_y + 4, SIDEBAR_WIDTH - 24, status_y + 20 };
         DrawTextA(memDC, badgeTxt, -1, &bTextR, DT_LEFT | DT_SINGLELINE);
 
@@ -816,6 +816,15 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         // Sidebar clicks
         if (x < SIDEBAR_WIDTH) {
+            // Status Box click -> Reconnect SDR
+            int status_box_y = 52;
+            if (x >= 16 && x <= SIDEBAR_WIDTH - 16 && y >= status_box_y && y <= status_box_y + 24) {
+                tv_demod_connect();
+                tune_active_channel();
+                InvalidateRect(hWnd, NULL, FALSE);
+                return 0;
+            }
+
             // Region Box click
             int reg_box_y = 52 + 30 + 16;
             if (x >= 16 && x <= SIDEBAR_WIDTH - 16 && y >= reg_box_y && y <= reg_box_y + 26) {
@@ -875,6 +884,16 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
         }
         return 0;
+    }
+
+    case WM_KEYDOWN: {
+        if (wParam == 'R' || wParam == 'r') {
+            tv_demod_connect();
+            tune_active_channel();
+            InvalidateRect(hWnd, NULL, FALSE);
+            return 0;
+        }
+        break;
     }
 
     case WM_SIZE: {

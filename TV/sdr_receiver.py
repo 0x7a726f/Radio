@@ -35,7 +35,7 @@ def detect_blocking_processes() -> List[str]:
     blocking = []
     try:
         import subprocess
-        cmd = 'powershell -NoProfile -Command "Get-Process | Where-Object {$_.ProcessName -match \'satdump|sdrpp|sdrangel\'} | Select-Object -ExpandProperty ProcessName"'
+        cmd = 'powershell -NoProfile -Command "Get-Process | Where-Object {$_.ProcessName -match \'satdump|sdrpp|sdrangel|tv_app|rtl_tcp|dump1090|welle\'} | Select-Object -ExpandProperty ProcessName"'
         out = subprocess.check_output(cmd, shell=True, text=True, timeout=3).strip()
         if out:
             blocking = [line.strip() for line in out.splitlines() if line.strip()]
@@ -147,11 +147,21 @@ class RtlSdrReceiver:
         else:
             # Check for blocking process like SatDump or SDR++
             blocking = detect_blocking_processes()
-            self.status = DeviceStatus.BUSY
             if blocking:
+                self.status = DeviceStatus.BUSY
                 procs = ", ".join(blocking)
                 self.status_detail = f"Dongle detected but held by: {procs}. Close them to release USB."
+            elif ret == -12:
+                self.status = DeviceStatus.DISCONNECTED
+                self.status_detail = f"WinUSB driver not installed on Interface 0 (code {ret}). Use Zadig to install WinUSB driver."
+            elif ret == -1:
+                self.status = DeviceStatus.DISCONNECTED
+                self.status_detail = f"USB I/O error ({ret}). Unplug and replug the dongle into a direct motherboard USB port."
+            elif ret == -3:
+                self.status = DeviceStatus.DISCONNECTED
+                self.status_detail = f"USB Access Denied ({ret}). Ensure WinUSB driver is installed or run as Administrator."
             else:
+                self.status = DeviceStatus.BUSY
                 self.status_detail = f"Dongle detected but USB error ({ret}). Running in Simulation fallback."
             return False
 

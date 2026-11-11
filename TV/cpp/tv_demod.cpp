@@ -632,6 +632,12 @@ DEMOD_API void tv_demod_shutdown() {
 DEMOD_API int tv_demod_connect() {
     if (!g_engine) return 0;
 
+    // Close any existing handle before reconnecting
+    if (g_engine->sdr_dev && fn_close) {
+        fn_close(g_engine->sdr_dev);
+        g_engine->sdr_dev = NULL;
+    }
+
     if (!load_rtlsdr_dll()) {
         g_engine->sdr_status = SDR_STATUS_DISCONNECTED;
         strcpy_s(g_engine->status_detail, sizeof(g_engine->status_detail), "rtlsdr.dll not found in workspace");
@@ -641,7 +647,7 @@ DEMOD_API int tv_demod_connect() {
     uint32_t cnt = fn_get_device_count ? fn_get_device_count() : 0;
     if (cnt == 0) {
         g_engine->sdr_status = SDR_STATUS_DISCONNECTED;
-        strcpy_s(g_engine->status_detail, sizeof(g_engine->status_detail), "No RTL-SDR USB dongle detected");
+        strcpy_s(g_engine->status_detail, sizeof(g_engine->status_detail), "No RTL-SDR dongle found (check USB / Zadig WinUSB)");
         return 0;
     }
 
@@ -666,9 +672,20 @@ DEMOD_API int tv_demod_connect() {
         fn_reset_buffer(dev);
         return 1;
     } else {
-        g_engine->sdr_status = SDR_STATUS_BUSY;
+        const char* err_hint = "USB open failed";
+        if (ret == -1) err_hint = "USB I/O error (unplug & replug dongle)";
+        else if (ret == -3) err_hint = "Access denied (run Zadig WinUSB or Admin)";
+        else if (ret == -5) err_hint = "Device not found / disconnected";
+        else if (ret == -6) err_hint = "Exclusive claim active (task in Task Manager)";
+        else if (ret == -12) err_hint = "WinUSB driver missing (install via Zadig)";
+
+        if (ret == -6) {
+            g_engine->sdr_status = SDR_STATUS_BUSY;
+        } else {
+            g_engine->sdr_status = SDR_STATUS_SIMULATED;
+        }
         sprintf_s(g_engine->status_detail, sizeof(g_engine->status_detail),
-            "Dongle detected (USB %d). Exclusive claim active - using RF Synthesizer", ret);
+            "USB Err %d: %s", ret, err_hint);
         return 0;
     }
 }

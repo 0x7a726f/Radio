@@ -296,9 +296,11 @@ class GreekTvDesktopApp(tk.Tk):
         self.status_var = tk.StringVar(value="Hardware: Initializing...")
         self.status_lbl = tk.Label(
             self.side_frame, textvariable=self.status_var,
-            bg="#24242c", fg="#a0a4b0", font=("Segoe UI", 8), padx=8, pady=4, relief="solid", bd=1
+            bg="#24242c", fg="#a0a4b0", font=("Segoe UI", 8), padx=8, pady=4, relief="solid", bd=1,
+            cursor="hand2"
         )
         self.status_lbl.pack(fill=tk.X, pady=(0, 10))
+        self.status_lbl.bind("<Button-1>", lambda e: self._reconnect_sdr())
 
         ttk.Label(self.side_frame, text="Region:", font=("Segoe UI", 8, "bold"), background="#1a1a1e").pack(anchor="w")
         reg_names = [r["name"] for r in REGIONS]
@@ -449,6 +451,13 @@ class GreekTvDesktopApp(tk.Tk):
         if self.vlc_playing:
             self._start_stream()
 
+    def _reconnect_sdr(self):
+        if demod_dll:
+            self.status_var.set("Hardware: Reconnecting...")
+            self.update_idletasks()
+            demod_dll.tv_demod_connect()
+            self._tune_current_channel()
+
     def _tune_current_channel(self):
         ch = CHANNELS[self.ch_idx]
         reg = REGIONS[self.region_idx]
@@ -588,10 +597,12 @@ class GreekTvDesktopApp(tk.Tk):
                 self.status_var.set(f"Hardware: RTL-SDR Active ({msg})")
                 self.status_lbl.config(bg="#1c3624", fg="#50c080")
             elif m.sdr_status == 2:
-                self.status_var.set("Hardware: Busy (Other process open)")
+                hint = f" ({msg})" if msg else ""
+                self.status_var.set(f"Hardware Busy{hint} [Click to Retry]")
                 self.status_lbl.config(bg="#3a2818", fg="#d09050")
             else:
-                self.status_var.set("Source: Synthetic Fallback")
+                hint = f" ({msg})" if msg else ""
+                self.status_var.set(f"Fallback Mode{hint} [Click to Reconnect]")
                 self.status_lbl.config(bg="#24242c", fg="#9095a8")
 
             self._draw_spectrum(m)
