@@ -2,6 +2,7 @@
 High-Speed CS16 Binary Stream Writer
 Converts incoming uint8 I/Q data to signed 16-bit integer (CS16) format
 and writes to disk via a dedicated buffered I/O thread.
+Accompanies every recording with a comprehensive parameters .txt file and structured .json.
 """
 
 import os
@@ -14,6 +15,8 @@ import threading
 from datetime import datetime
 from typing import Optional, Dict, Any
 import numpy as np
+
+HI_REST_FREQ_HZ = 1420405751.786  # 1420.405752 MHz
 
 
 class Cs16Writer:
@@ -93,7 +96,7 @@ class Cs16Writer:
         return self.current_filepath
 
     def stop_recording(self) -> Dict[str, Any]:
-        """Stop recording and write sidecar JSON metadata."""
+        """Stop recording and write accompanied parameters .txt file and sidecar .json."""
         if not self.is_recording:
             return {}
 
@@ -106,12 +109,20 @@ class Cs16Writer:
 
         duration_s = time.time() - self.start_time if self.start_time else 0.0
 
+        # Offset calculation
+        offset_hz = self.center_freq_hz - HI_REST_FREQ_HZ
+        offset_khz = offset_hz / 1e3
+        offset_mhz = offset_hz / 1e6
+
         metadata = {
             "format": "cs16",
             "endianness": "little",
             "bytes_per_sample": 4,
             "sample_rate_hz": self.sample_rate_hz,
             "center_freq_hz": self.center_freq_hz,
+            "hi_rest_freq_hz": HI_REST_FREQ_HZ,
+            "lo_offset_hz": offset_hz,
+            "lo_offset_khz": round(offset_khz, 3),
             "timestamp": datetime.fromtimestamp(self.start_time).isoformat() if self.start_time else "",
             "duration_seconds": round(duration_s, 2),
             "total_samples": self.samples_written,
@@ -122,16 +133,101 @@ class Cs16Writer:
             "file_path": os.path.abspath(self.current_filepath) if self.current_filepath else "",
         }
 
-        # Write sidecar JSON
         if self.current_filepath and os.path.exists(self.current_filepath):
-            json_path = os.path.splitext(self.current_filepath)[0] + ".json"
+            base_path = os.path.splitext(self.current_filepath)[0]
+            
+            # 1. Write Accompanied Parameters .txt File
+            txt_path = base_path + ".txt"
+            self._write_accompanied_txt(txt_path, metadata)
+
+            # 2. Write Sidecar .json
+            json_path = base_path + ".json"
             try:
                 with open(json_path, "w", encoding="utf-8") as f:
                     json.dump(metadata, f, indent=2)
             except Exception as e:
-                print(f"Error saving sidecar metadata: {e}")
+                print(f"Error saving sidecar JSON: {e}")
 
         return metadata
+
+    def _write_accompanied_txt(self, txt_path: str, meta: Dict[str, Any]):
+        """Write human-readable parameters text file with exact parameters for Analyzer."""
+        fc_hz = meta["center_freq_hz"]
+        fc_mhz = fc_hz / 1e6
+        fs_hz = meta["sample_rate_hz"]
+        fs_msps = fs_hz / 1e6
+        offset_hz = meta["lo_offset_hz"]
+        offset_khz = meta["lo_offset_khz"]
+        dur_s = meta["duration_seconds"]
+        dur_min = dur_s / 60.0
+        size_mb = meta["file_size_bytes"] / (1024 * 1024)
+        size_gb = meta["file_size_bytes"] / (1024**3)
+        cs16_filename = os.path.basename(meta["file_path"])
+
+        passband_min_mhz = (fc_hz - fs_hz / 2.0) / 1e6
+        passband_max_mhz = (fc_hz + fs_hz / 2.0) / 1e6
+
+        if abs(offset_khz) < 1.0:
+            offset_desc = "DIRECT CENTERED (LO placed exactly on HI line; residual DC spike may affect line peak)"
+        elif offset_hz > 0:
+            offset_desc = f"+{offset_khz:.2f} kHz ABOVE HI line (EXCELLENT: LO DC spike is safe and clear of the HI line)"
+        else:
+            offset_desc = f"{offset_khz:.2f} kHz BELOW HI line (EXCELLENT: LO DC spike is safe and clear of the HI line)"
+
+        content = f"""================================================================================
+  HYDROGEN LINE (21cm) RADIO ASTRONOMY OBSERVATION PARAMETERS
+================================================================================
+Recording File:             {cs16_filename}
+Full Path:                  {meta["file_path"]}
+Capture Timestamp:          {meta["timestamp"]}
+Receiver Hardware:          {meta["device"]}
+
+1. OBSERVATIONAL FREQUENCIES & LO OFFSET
+--------------------------------------------------------------------------------
+Celestial Target Line:      Neutral Atomic Hydrogen (H I, 21 cm Spin-Flip)
+HI Rest Frequency:          1420.405752 MHz (1420405751.786 Hz)
+Tuned SDR Center LO:        {fc_mhz:.6f} MHz ({fc_hz:,.0f} Hz)
+LO Frequency Offset:        {offset_khz:+.3f} kHz ({offset_hz:+,.0f} Hz)
+Offset Strategy:            {offset_desc}
+DC Spike Excision Window:   Excise +/- 5.0 kHz around {fc_mhz:.6f} MHz
+
+2. SDR HARDWARE & RF CONFIGURATION
+--------------------------------------------------------------------------------
+Sampling Rate (Fs):         {fs_msps:.3f} MSPS ({fs_hz:,.0f} Hz)
+Receiver Nyquist Bandwidth: {fs_msps:.3f} MHz (Coverage: {passband_min_mhz:.3f} to {passband_max_mhz:.3f} MHz)
+Tuner LNA Gain:             {meta["gain_db"]:.1f} dB
+Bias-Tee (4.5V LNA Power):  {'Enabled (Powers external Sawbird+ H1 LNA)' if meta["bias_tee"] else 'Disabled'}
+Data Format:                CS16 (Signed 16-bit Complex Integer, Little-Endian)
+Bytes Per Complex Sample:   4 bytes (2 bytes I + 2 bytes Q)
+Sample Interleaving:        [I0, Q0, I1, Q1, I2, Q2, ...]
+
+3. ACQUISITION RUNTIME METRICS
+--------------------------------------------------------------------------------
+Observation Duration:       {dur_s:.2f} seconds ({dur_min:.2f} minutes)
+Total Complex Samples:      {meta["total_samples"]:,} samples
+Total File Size:            {meta["file_size_bytes"]:,} bytes ({size_mb:.2f} MB / {size_gb:.3f} GB)
+Average Data Rate:          {(fs_hz * 4) / (1024 * 1024):.2f} MB/s
+
+4. OFFLINE ANALYSIS INSTRUCTIONS
+--------------------------------------------------------------------------------
+The accompanying Analyzer can automatically read this file, or you can run
+directly with the observed parameters:
+
+  [Primary Analysis Pipeline]
+  python Analyzer/astro_analyzer.py "{cs16_filename}" --fc {fc_mhz:.4f}MHz --fs {fs_msps:.3f}MSPS
+
+  [Quick 3-Panel Matplotlib Viewer]
+  python Analyzer/hydro_quick.py "{cs16_filename}" --fc {fc_mhz:.4f}M --fs {fs_msps:.3f}M
+
+  [Interactive Wizard (Auto-Detects Parameters)]
+  python Analyzer/run.py
+================================================================================
+"""
+        try:
+            with open(txt_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception as e:
+            print(f"Error saving accompanied parameters TXT: {e}")
 
     def feed_samples(self, raw_u8: np.ndarray):
         """Enqueue raw uint8 samples from SDR acquisition callback."""
@@ -146,7 +242,6 @@ class Cs16Writer:
         try:
             self.write_queue.put_nowait(raw_u8)
         except queue.Full:
-            # Drop frame rather than blocking SDR acquisition
             pass
 
     def _writer_loop(self):
@@ -180,12 +275,10 @@ class Cs16Writer:
         secs = int(elapsed_s % 60)
         elapsed_str = f"{hrs:02d}:{mins:02d}:{secs:02d}"
 
-        # Disk space calculations
         disk_target = self.output_dir if os.path.exists(self.output_dir) else "."
         total, used, free = shutil.disk_usage(disk_target)
         free_gb = free / (1024**3)
 
-        # Time left based on 4 bytes per sample (CS16)
         bytes_per_sec = self.sample_rate_hz * 4
         if bytes_per_sec > 0:
             time_left_s = free / bytes_per_sec
@@ -200,7 +293,6 @@ class Cs16Writer:
         else:
             time_left_str = "--:--:--"
 
-        # File size display
         size_mb = self.bytes_written / (1024 * 1024)
         if size_mb >= 1024.0:
             size_str = f"{size_mb / 1024.0:.2f} GB"

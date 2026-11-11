@@ -8,8 +8,9 @@ import os
 import sys
 import argparse
 import glob
+import json
 import time
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any
 
 import numpy as np
 
@@ -95,6 +96,58 @@ def find_cs16_files(parent_dir: str) -> List[str]:
     return unique_files
 
 
+def load_accompanied_parameters(cs16_path: str) -> Dict[str, Any]:
+    """
+    Search for accompanied parameter files (.json or .txt) matching the given .cs16 file
+    and extract observation parameters (center LO, sample rate, gain, offset).
+    """
+    params = {}
+    base = os.path.splitext(cs16_path)[0]
+
+    # 1. Try JSON sidecar
+    json_path = base + ".json"
+    if os.path.exists(json_path):
+        try:
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if "center_freq_hz" in data:
+                    params["center_freq_hz"] = float(data["center_freq_hz"])
+                if "sample_rate_hz" in data:
+                    params["sample_rate_hz"] = float(data["sample_rate_hz"])
+                if "gain_db" in data:
+                    params["gain_db"] = float(data["gain_db"])
+                if "lo_offset_khz" in data:
+                    params["lo_offset_khz"] = float(data["lo_offset_khz"])
+                params["source"] = os.path.basename(json_path)
+                return params
+        except Exception:
+            pass
+
+    # 2. Try TXT parameter report
+    txt_path = base + ".txt"
+    if os.path.exists(txt_path):
+        try:
+            with open(txt_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if "Tuned SDR Center LO:" in line:
+                        parts = line.split(":")
+                        if len(parts) > 1:
+                            val_part = parts[1].strip().split()[0]
+                            params["center_freq_hz"] = float(val_part.replace(",", "")) * 1e6
+                    elif "Sampling Rate (Fs):" in line:
+                        parts = line.split(":")
+                        if len(parts) > 1:
+                            val_part = parts[1].strip().split()[0]
+                            params["sample_rate_hz"] = float(val_part.replace(",", "")) * 1e6
+            if params:
+                params["source"] = os.path.basename(txt_path)
+                return params
+        except Exception:
+            pass
+
+    return params
+
+
 def interactive_wizard() -> Tuple[str, AstroConfig]:
     """
     Interactive prompt wizard when running without CLI arguments.
@@ -137,16 +190,27 @@ def interactive_wizard() -> Tuple[str, AstroConfig]:
 
     print(f"\nTarget File Selected: {chosen_file}")
     
+    # Auto-load accompanied parameters if available (.txt or .json)
+    auto_params = load_accompanied_parameters(chosen_file)
+    default_fc = auto_params.get("center_freq_hz", 1420.5e6) / 1e6
+    default_fs = auto_params.get("sample_rate_hz", 2.4e6) / 1e6
+    if auto_params:
+        print(f"\n[Accompanied Parameters Detected: {auto_params.get('source')}]")
+        print(f"  Center LO:   {default_fc:.6f} MHz")
+        print(f"  Sample Rate: {default_fs:.3f} MSPS")
+        if "lo_offset_khz" in auto_params:
+            print(f"  LO Offset:   {auto_params['lo_offset_khz']:+.3f} kHz from HI line")
+
     # Center frequency prompt (combats DC spike)
     print("\n--- Center Frequency (Combats SDR DC Spikes) ---")
     print(f"Astronomical HI Rest Frequency is: {HYDROGEN_REST_FREQ_MHZ:.4f} MHz")
     print("Tip: If you tuned off-center (e.g. 1420.5 MHz or 1420.8 MHz), enter your exact LO frequency.")
-    fc_input = input("Enter SDR Center Frequency in MHz [default: 1420.5]: ").strip()
-    center_freq_hz = parse_freq_or_rate(fc_input, default_is_mhz=True) if fc_input else 1420.5e6
+    fc_input = input(f"Enter SDR Center Frequency in MHz [default: {default_fc:.4f}]: ").strip()
+    center_freq_hz = parse_freq_or_rate(fc_input, default_is_mhz=True) if fc_input else (default_fc * 1e6)
 
     # Sample rate prompt
-    fs_input = input("\nEnter SDR Sample Rate in MSPS [default: 2.4]: ").strip()
-    sample_rate_hz = parse_freq_or_rate(fs_input, default_is_mhz=True) if fs_input else 2.4e6
+    fs_input = input(f"\nEnter SDR Sample Rate in MSPS [default: {default_fs:.3f}]: ").strip()
+    sample_rate_hz = parse_freq_or_rate(fs_input, default_is_mhz=True) if fs_input else (default_fs * 1e6)
 
     # Duration prompt
     dur_input = input("\nDuration to analyze in seconds [press Enter for full observation]: ").strip()
@@ -378,8 +442,24 @@ def main():
                 print(f"Error: Specified file not found: {filepath}")
                 sys.exit(1)
 
-        fc_hz = parse_freq_or_rate(args.center_freq, default_is_mhz=True) if args.center_freq else 1420.5e6
-        fs_hz = parse_freq_or_rate(args.sample_rate, default_is_mhz=True)
+        # Auto-load accompanied parameters (.txt or .json) if not overridden by CLI flags
+        auto_params = load_accompanied_parameters(filepath)
+        if args.center_freq:
+            fc_hz = parse_freq_or_rate(args.center_freq, default_is_mhz=True)
+        elif "center_freq_hz" in auto_params:
+            fc_hz = auto_params["center_freq_hz"]
+            print(f"Auto-configured Center LO from {auto_params['source']}: {fc_hz/1e6:.6f} MHz")
+        else:
+            fc_hz = 1420.5e6
+
+        if args.sample_rate and args.sample_rate != "2.4MSPS":
+            fs_hz = parse_freq_or_rate(args.sample_rate, default_is_mhz=True)
+        elif "sample_rate_hz" in auto_params:
+            fs_hz = auto_params["sample_rate_hz"]
+            print(f"Auto-configured Sample Rate from {auto_params['source']}: {fs_hz/1e6:.3f} MSPS")
+        else:
+            fs_hz = parse_freq_or_rate(args.sample_rate, default_is_mhz=True)
+
         out_dir = args.output_dir if args.output_dir else os.path.join(current_dir, "output")
 
         config = AstroConfig(

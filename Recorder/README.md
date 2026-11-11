@@ -1,41 +1,57 @@
 # Recorder - Hydrogen Line Live SDR Receiver & CS16 Capture App
 
-A real-time Software-Defined Radio (SDR) live receiver and lossless I/Q recorder styled after **SatDump**. Engineered for astronomical observations of the **21cm Neutral Hydrogen (H I) Line** ($\sim 1420.40575\text{ MHz}$).
+A real-time Software-Defined Radio (SDR) live receiver and lossless I/Q recorder styled after **SatDump**. Engineered for astronomical observations of the **21cm Neutral Hydrogen (H I) Line** ($\sim 1420.40575\text{ MHz}$) and general wideband RF monitoring.
 
-Acquires raw RF from RTL-SDR dongles (e.g., RTL-SDR Blog V4, V3, and compatible RTL2832U devices) and streams directly to disk in the standardized **CS16** format (complex signed 16-bit integers, interleaved I/Q, 4 bytes per sample), ready for immediate ingestion by the [Analyzer](../Analyzer).
+Acquires raw RF from RTL-SDR dongles (e.g., RTL-SDR Blog V4, V3, and compatible RTL2832U devices) and streams directly to disk in the standardized **CS16** format (complex signed 16-bit integers, interleaved I/Q, 4 bytes per sample), accompanied by a comprehensive observation parameters `.txt` file and structured `.json` metadata for instant ingestion by the [Analyzer](../Analyzer).
 
 ---
 
 ## Key Features
 
-- **SatDump-Style Control Panels**:
-  - **▼ Device**:
-    - Hardware selector with auto-detection of device strings (e.g. `RTLSDRBlog Blog V4 #00000001`).
-    - Refresh button (`⟳`) to re-scan USB buses and detect active/released devices.
-    - Large digital frequency display (`001.420.500.000 Hz`) with click-to-edit frequency prompt.
-    - Quick presets for Hydrogen Line observations (`1420.5 MHz` LO offset +94k, `1420.406 MHz` rest center, `1420.2 MHz`).
-    - Configurable sample rate (`1.024`, `2.048`, `2.4`, `2.56`, `3.2 Msps`).
-    - LNA Gain slider (`0.0` to `49.6 dB`) with AGC toggle.
-    - Software-switchable **Bias-Tee (4.5V)** toggle to power external LNAs (such as the Nooelec Sawbird+ H1) directly through coaxial feedlines.
-    - Automatic process conflict detection (notifies if SatDump, SDR++, or SDRangel is currently holding the USB interface).
-  - **▼ FFT Display**:
-    - Selectable FFT size (`2048`, `4096`, `8192`, `16384`).
-    - Dynamic dB range scaling (`FFT Max` and `FFT Min` sliders).
-    - Adjustable exponential averaging (`0%` to `95%`).
-    - Color palettes (`Classic [Youssef Touil]`, `Viridis`, `Turbo`, `Inferno`, `Magma`).
-    - Toggleable waterfall and frequency grid overlay.
-  - **▼ Recording**:
-    - Standardized **CS16** output format (2 bytes signed I + 2 bytes signed Q).
-    - Dynamic live file size counter (`0.00 MB` -> `1.20 GB`).
-    - Partition free disk space monitor and estimated recording time remaining.
-    - Status indicators: `IDLE` (red) / `RECORDING` (green with elapsed timer).
-    - Writes companion `.json` metadata sidecar with observation parameters (center LO, sample rate, timestamp, gain, bias-tee, duration).
-    - **One-click "Open in Offline Analyzer" button** to instantly launch the offline pipeline on newly captured data.
-- **Spectrum & Waterfall Visualizer**:
-  - Top: Live RF power spectrum curve with dB axis, peak HUD readout, DC LO center marker, and a prominent red marker at the exact astronomical Hydrogen line rest frequency ($1420.40575\text{ MHz}$).
-  - Bottom: 2D rolling waterfall spectrogram rendered at up to 60 FPS using Pillow blitting.
-- **Virtual SDR Simulation Mode**:
-  - If no hardware dongle is connected or the USB port is temporarily occupied by an external application, the recorder seamlessly falls back to a realistic simulated RF passband featuring background thermal noise, coaxial standing wave ripples, and a synthetic 21cm Hydrogen Line peak.
+- **Ultra-Fast & Responsive GUI**:
+  - In-place memory-buffered waterfall rendering using `PhotoImage.paste()` (< 0.15 ms/frame).
+  - Persistent canvas line coordinate updates (`canvas.coords()`) eliminating memory churn and event loop freezing.
+  - Smooth 30–60 FPS spectrum and rolling waterfall display.
+- **Universal Multi-Frequency Tuning**:
+  - **Direct Numeric Entry**: Type any frequency into the `Tune` entry box (e.g. `89.2`, `1420.5M`, `1420405752`, `433.92`, `1090`) and press Enter.
+  - **Quick Step Buttons**: Immediate delta increments/decrements: `-1M` `+1M` | `-100k` `+100k` | `-10k` `+10k`.
+  - **Digital Segmented Readout**: `001.420.500.000 Hz` with interactive mouse-wheel stepping.
+  - **Band & Channel Presets**:
+    - `H I 1420.5M (LO +94k)`
+    - `H I 1420.406M (Rest Line)`
+    - `H I 1420.2M (SatDump)`
+    - `FM 89.2 MHz (Broadcast)`
+    - `FM 100.0 MHz (Broadcast)`
+    - `Airband 121.5 MHz (ATIS)`
+    - `Ham 144.8 MHz (2m APRS)`
+    - `ISM 433.92 MHz (Telemetry)`
+    - `ADS-B 1090.0 MHz (Aviation)`
+- **▼ Device Controls**:
+  - Hardware selector with auto-detection of device strings (e.g. `RTLSDRBlog Blog V4 #00000001`).
+  - Refresh button (`⟳`) to re-scan USB buses and detect active/released devices.
+  - Configurable sample rate (`1.024`, `2.048`, `2.4`, `2.56`, `3.2 Msps`).
+  - LNA Gain slider (`0.0` to `49.6 dB`) with AGC toggle.
+  - Software-switchable **Bias-Tee (4.5V)** toggle to power external LNAs (such as the Nooelec Sawbird+ H1) directly through coaxial feedlines.
+- **▼ Accompanied Observation Parameters (`.txt` & `.json`)**:
+  - Every capture automatically generates:
+    1. `<filename>.cs16`: Raw lossless 16-bit I/Q binary stream.
+    2. `<filename>.txt`: Detailed human-readable observation report containing exact center LO frequency, sample rate, calculated LO offset from the HI rest line in kHz, DC spike safety clearance, gain, duration, total samples, and copy-paste analysis commands.
+    3. `<filename>.json`: Machine-readable metadata sidecar.
+  - **Auto-Ingestion in Analyzer**: The [Analyzer](../Analyzer) automatically reads the accompanied parameter file and configures the pipeline without requiring manual CLI arguments!
+- **▼ FFT Display**:
+  - Selectable FFT size (`2048`, `4096`, `8192`, `16384`).
+  - Dynamic dB range scaling (`FFT Max` and `FFT Min` sliders).
+  - Adjustable exponential averaging (`0%` to `95%`).
+  - Color palettes (`Classic [Youssef Touil]`, `Viridis`, `Turbo`, `Inferno`, `Magma`).
+  - Toggleable waterfall and frequency grid overlay.
+- **▼ Recording & Live Stats**:
+  - Standardized **CS16** output format (2 bytes signed I + 2 bytes signed Q).
+  - Dynamic live file size counter (`0.00 MB` -> `1.20 GB`).
+  - Partition free disk space monitor and estimated recording time remaining.
+  - Status indicators: `IDLE` (red) / `RECORDING` (green with elapsed timer).
+  - **One-click "Open in Offline Analyzer" button** to instantly launch the offline pipeline on newly captured data.
+- **Multi-Frequency Virtual SDR Mode**:
+  - If no physical dongle is connected, the app provides realistic RF simulations for all bands (Hydrogen line with 710 kHz coax ripple at 1420 MHz, FM broadcast carriers with stereo modulation at 88–108 MHz, AM airband at 118–137 MHz, etc.) so the entire interface can be tested anywhere.
 
 ---
 

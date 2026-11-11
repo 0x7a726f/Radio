@@ -1,5 +1,5 @@
 """
-SDR Streaming Interface using rtlsdr.dll via ctypes with simulation fallback.
+SDR Streaming Interface using rtlsdr.dll via ctypes with responsive multi-frequency RF simulation.
 Acquires raw I/Q samples from hardware RTL-SDR dongles (e.g. RTL-SDR Blog V4/V3).
 """
 
@@ -11,6 +11,10 @@ import threading
 from typing import Optional, List, Tuple, Callable
 import numpy as np
 import psutil
+
+# Cache blocking processes for 3 seconds to avoid polling overhead
+_last_proc_check = 0.0
+_cached_blocking = []
 
 
 def find_dll() -> Optional[str]:
@@ -28,8 +32,13 @@ def find_dll() -> Optional[str]:
     return None
 
 
-def detect_blocking_processes() -> List[str]:
+def detect_blocking_processes(force: bool = False) -> List[str]:
     """Check if any known SDR process is currently running and holding the USB device."""
+    global _last_proc_check, _cached_blocking
+    now = time.time()
+    if not force and (now - _last_proc_check) < 3.0:
+        return _cached_blocking
+
     blocking = []
     known_sdr = ['satdump', 'sdrpp', 'sdrangel', 'tv_app', 'rtl_tcp', 'dump1090', 'welle']
     for p in psutil.process_iter(['name']):
@@ -39,7 +48,9 @@ def detect_blocking_processes() -> List[str]:
                 blocking.append(name)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-    return list(set(blocking))
+    _cached_blocking = list(set(blocking))
+    _last_proc_check = now
+    return _cached_blocking
 
 
 class SdrStream:
@@ -137,11 +148,11 @@ class SdrStream:
     def scan_devices(self) -> List[str]:
         """Scan available RTL-SDR hardware devices."""
         if not self.dll:
-            return ["Simulation Device (Virtual SDR)"]
+            return ["Virtual SDR Mode (Simulation)"]
         try:
             count = self.dll.rtlsdr_get_device_count()
             if count == 0:
-                return ["Simulation Device (Virtual SDR)"]
+                return ["Virtual SDR Mode (Simulation)"]
             
             devices = []
             for i in range(count):
@@ -162,7 +173,7 @@ class SdrStream:
                 devices.append(name_str)
             return devices
         except Exception:
-            return ["Simulation Device (Virtual SDR)"]
+            return ["Virtual SDR Mode (Simulation)"]
 
     def open(self, device_index: int = 0) -> bool:
         """Open physical SDR device or fall back to simulation mode."""
@@ -190,7 +201,7 @@ class SdrStream:
                         self.is_simulated = False
                         devices = self.scan_devices()
                         self.device_name = devices[device_index] if device_index < len(devices) else "RTL-SDR"
-                        self.status_detail = f"Connected to {self.device_name}"
+                        self.status_detail = f"Connected: {self.device_name}"
                         
                         # Apply initial hardware settings
                         self.set_sample_rate(self.sample_rate_hz)
@@ -200,7 +211,7 @@ class SdrStream:
                         self.set_ppm(self.ppm_correction)
                         return True
                     else:
-                        self.status_detail = f"Could not open device (code {ret})."
+                        self.status_detail = f"Dongle detected but open failed (code {ret})."
             except Exception as e:
                 self.status_detail = f"Hardware open error: {e}"
 
@@ -209,7 +220,7 @@ class SdrStream:
         self.is_simulated = True
         self.device_name = "Virtual SDR (Simulation Mode)"
         if not self.status_detail:
-            self.status_detail = "Virtual SDR active (Hydrogen Line simulation)."
+            self.status_detail = "Virtual SDR Active (Multi-band RF simulation)."
         return True
 
     def close(self):
@@ -250,7 +261,7 @@ class SdrStream:
                 pass
 
     def set_frequency(self, freq_hz: int):
-        self.center_freq_hz = freq_hz
+        self.center_freq_hz = int(freq_hz)
         if self.dev and self.dll and not self.is_simulated:
             try:
                 self.dll.rtlsdr_set_center_freq(self.dev, int(freq_hz))
@@ -335,32 +346,73 @@ class SdrStream:
                 else:
                     time.sleep(0.005)
             else:
-                # Simulation mode: generate realistic 21cm Hydrogen Line RF
+                # Simulation mode: generate multi-frequency realistic RF
                 chunk_samples = buf_len // 2
                 t = (np.arange(chunk_samples) + sim_sample_idx) / self.sample_rate_hz
                 sim_sample_idx += chunk_samples
 
-                # 1. Thermal background noise floor
-                noise = np.random.normal(0, 16.0, chunk_samples) + 1j * np.random.normal(0, 16.0, chunk_samples)
+                # Thermal noise floor
+                noise = np.random.normal(0, 14.0, chunk_samples) + 1j * np.random.normal(0, 14.0, chunk_samples)
+                fc = self.center_freq_hz
+                span = self.sample_rate_hz
 
-                # 2. Coaxial cable standing wave ripple (~710 kHz period)
-                ripple_freq = 710000.0
-                ripple = 4.0 * np.sin(2 * np.pi * ripple_freq * t)
+                signal_component = np.zeros(chunk_samples, dtype=np.complex64)
 
-                # 3. Celestial Neutral Hydrogen Line (1420.40575 MHz)
-                hi_offset_hz = 1420405752.0 - self.center_freq_hz
-                if abs(hi_offset_hz) < (self.sample_rate_hz * 0.45):
-                    # Filtered emission profile with galactic Doppler shift (-15 km/s = +71 kHz)
-                    hi_sig = np.random.normal(0, 14.0, chunk_samples) + 1j * np.random.normal(0, 14.0, chunk_samples)
-                    hi_carrier = np.exp(1j * 2 * np.pi * hi_offset_hz * t)
-                    hi_emission = hi_sig * hi_carrier
+                # 1. Hydrogen Line band (~1420 MHz)
+                if abs(fc - 1420405752) < span:
+                    hi_offset = 1420405752.0 - fc
+                    hi_sig = np.random.normal(0, 15.0, chunk_samples) + 1j * np.random.normal(0, 15.0, chunk_samples)
+                    signal_component += (hi_sig * np.exp(1j * 2 * np.pi * hi_offset * t)).astype(np.complex64)
+                    # Add coaxial standing wave ripple (~710 kHz)
+                    signal_component += (3.5 * np.sin(2 * np.pi * 710000.0 * t)).astype(np.complex64)
+
+                # 2. FM Broadcast Band (87.5 - 108.0 MHz)
+                elif 80e6 <= fc <= 115e6:
+                    # Emulate standard FM stations e.g. 89.2 MHz, 92.5 MHz, 98.6 MHz, 100.3 MHz
+                    fm_stations = [88.5e6, 89.2e6, 92.6e6, 96.9e6, 98.6e6, 100.3e6, 103.7e6, 105.8e6]
+                    for st_f in fm_stations:
+                        offset = st_f - fc
+                        if abs(offset) < (span * 0.48):
+                            # Wideband FM modulated signal with stereo subcarriers
+                            mod = np.sin(2 * np.pi * 1000.0 * t) + 0.3 * np.sin(2 * np.pi * 19000.0 * t)
+                            phase = 2 * np.pi * offset * t + 75000.0 / 1000.0 * mod
+                            signal_component += (38.0 * np.exp(1j * phase)).astype(np.complex64)
+
+                # 3. Aircraft Airband (118 - 137 MHz)
+                elif 118e6 <= fc <= 137e6:
+                    offset = 121.5e6 - fc  # Emergency / ATIS
+                    if abs(offset) < (span * 0.48):
+                        am_sig = (1.0 + 0.6 * np.sin(2 * np.pi * 1020.0 * t)) * np.exp(1j * 2 * np.pi * offset * t)
+                        signal_component += (24.0 * am_sig).astype(np.complex64)
+
+                # 4. 2-Meter Amateur Band (144 - 148 MHz)
+                elif 144e6 <= fc <= 148e6:
+                    offset = 144.8e6 - fc  # APRS packet
+                    if abs(offset) < (span * 0.48):
+                        signal_component += (28.0 * np.exp(1j * 2 * np.pi * offset * t)).astype(np.complex64)
+
+                # 5. 70cm / ISM 433 MHz Band
+                elif 430e6 <= fc <= 440e6:
+                    offset = 433.92e6 - fc  # ISM telemetry
+                    if abs(offset) < (span * 0.48):
+                        signal_component += (30.0 * np.exp(1j * 2 * np.pi * offset * t)).astype(np.complex64)
+
+                # 6. ADS-B 1090 MHz
+                elif 1080e6 <= fc <= 1100e6:
+                    offset = 1090.0e6 - fc
+                    if abs(offset) < (span * 0.48):
+                        pulses = np.random.choice([0, 1], size=chunk_samples, p=[0.97, 0.03])
+                        signal_component += (45.0 * pulses * np.exp(1j * 2 * np.pi * offset * t)).astype(np.complex64)
+
+                # 7. Generic test carrier for any other frequency
                 else:
-                    hi_emission = 0
+                    test_offset = span * 0.15  # +15% off-center carrier
+                    signal_component += (22.0 * np.exp(1j * 2 * np.pi * test_offset * t)).astype(np.complex64)
 
-                # 4. Central LO DC offset spike
-                dc_spike = 12.0 * np.exp(1j * np.zeros_like(t))
+                # Central DC LO leakage spike
+                dc_spike = 10.0 * np.exp(1j * np.zeros_like(t))
 
-                total_iq = noise + ripple + hi_emission + dc_spike
+                total_iq = noise + signal_component + dc_spike
                 i_vals = np.clip(np.real(total_iq) + 128.0, 0, 255).astype(np.uint8)
                 q_vals = np.clip(np.imag(total_iq) + 128.0, 0, 255).astype(np.uint8)
 

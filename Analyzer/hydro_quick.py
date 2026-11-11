@@ -164,12 +164,52 @@ def process_file(
     plt.show()
 
 
+def load_accompanied_parameters(cs16_path: str):
+    base = os.path.splitext(cs16_path)[0]
+    json_path = base + ".json"
+    if os.path.exists(json_path):
+        try:
+            import json
+            with open(json_path, "r", encoding="utf-8") as f:
+                d = json.load(f)
+                return float(d.get("center_freq_hz", 1420.5e6)), float(d.get("sample_rate_hz", 2.4e6)), os.path.basename(json_path)
+        except Exception:
+            pass
+
+    txt_path = base + ".txt"
+    if os.path.exists(txt_path):
+        try:
+            fc, fs = None, None
+            with open(txt_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if "Tuned SDR Center LO:" in line:
+                        parts = line.split(":")
+                        if len(parts) > 1:
+                            fc = float(parts[1].strip().split()[0].replace(",", "")) * 1e6
+                    elif "Sampling Rate (Fs):" in line:
+                        parts = line.split(":")
+                        if len(parts) > 1:
+                            fs = float(parts[1].strip().split()[0].replace(",", "")) * 1e6
+            if fc and fs:
+                return fc, fs, os.path.basename(txt_path)
+        except Exception:
+            pass
+
+    return 1420.5e6, 2.4e6, None
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Quick 3-Panel Hydrogen Line Viewer")
     parser.add_argument("file", help="Path to raw .cs16 file")
-    parser.add_argument("--fc", type=float, default=1420.5e6, help="Center LO frequency in Hz (default: 1420.5e6)")
-    parser.add_argument("--fs", type=float, default=2.4e6, help="Sample rate in Hz (default: 2.4e6)")
+    parser.add_argument("--fc", type=float, default=None, help="Center LO frequency in Hz (default: from .txt/.json or 1420.5e6)")
+    parser.add_argument("--fs", type=float, default=None, help="Sample rate in Hz (default: from .txt/.json or 2.4e6)")
     parser.add_argument("--duration", type=float, default=None, help="Max duration in seconds")
     args = parser.parse_args()
 
-    process_file(args.file, center_freq_hz=args.fc, sample_rate_hz=args.fs, max_duration_s=args.duration)
+    auto_fc, auto_fs, src = load_accompanied_parameters(args.file)
+    fc = args.fc if args.fc is not None else auto_fc
+    fs = args.fs if args.fs is not None else auto_fs
+    if src and (args.fc is None or args.fs is None):
+        print(f"Auto-configured from accompanied file '{src}': LO={fc/1e6:.4f} MHz, Fs={fs/1e6:.3f} MSPS")
+
+    process_file(args.file, center_freq_hz=fc, sample_rate_hz=fs, max_duration_s=args.duration)
