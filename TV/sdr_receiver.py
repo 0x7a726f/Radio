@@ -106,6 +106,15 @@ class RtlSdrReceiver:
                 ctypes.c_int,
                 ctypes.POINTER(ctypes.c_int)
             ]
+
+            if hasattr(self.dll, 'rtlsdr_get_device_usb_strings'):
+                self.dll.rtlsdr_get_device_usb_strings.restype = ctypes.c_int
+                self.dll.rtlsdr_get_device_usb_strings.argtypes = [
+                    ctypes.c_uint32,
+                    ctypes.c_char_p,
+                    ctypes.c_char_p,
+                    ctypes.c_char_p
+                ]
         except Exception as e:
             self.status = DeviceStatus.DISCONNECTED
             self.status_detail = f"Failed to initialize DLL: {e}"
@@ -123,19 +132,62 @@ class RtlSdrReceiver:
             self.status_detail = "No RTL-SDR USB dongle detected."
             return False
 
-        try:
-            raw_name = self.dll.rtlsdr_get_device_name(0)
-            if raw_name:
-                self.device_name = raw_name.decode("utf-8", errors="replace")
-        except Exception:
-            pass
+        # Discover and prioritize RTL-SDR Blog V4
+        target_idx = 0
+        for i in range(cnt):
+            try:
+                raw_name = self.dll.rtlsdr_get_device_name(i)
+                if raw_name:
+                    dname = raw_name.decode("utf-8", errors="replace")
+                    if "Blog V4" in dname or "RTLSDRBlog" in dname:
+                        target_idx = i
+                        break
+            except Exception:
+                pass
 
-        dev = ctypes.c_void_p()
-        ret = self.dll.rtlsdr_open(ctypes.byref(dev), 0)
-        if ret == 0:
+        try_order = [target_idx] + [i for i in range(cnt) if i != target_idx]
+        dev = None
+        last_ret = -1
+        connected_idx = -1
+
+        for idx in try_order:
+            d = ctypes.c_void_p()
+            ret = self.dll.rtlsdr_open(ctypes.byref(d), idx)
+            if ret == 0 and d:
+                dev = d
+                connected_idx = idx
+                last_ret = 0
+                break
+            else:
+                last_ret = ret
+
+        if dev and connected_idx >= 0:
             self.dev = dev
             self.is_open = True
             self.status = DeviceStatus.CONNECTED
+
+            # Read full USB product and serial if available
+            try:
+                if hasattr(self.dll, 'rtlsdr_get_device_usb_strings'):
+                    mfg = ctypes.create_string_buffer(256)
+                    prd = ctypes.create_string_buffer(256)
+                    ser = ctypes.create_string_buffer(256)
+                    self.dll.rtlsdr_get_device_usb_strings(connected_idx, mfg, prd, ser)
+                    p_str = prd.value.decode("utf-8", errors="replace")
+                    s_str = ser.value.decode("utf-8", errors="replace")
+                    if p_str and s_str:
+                        self.device_name = f"{p_str} #{s_str}"
+                    elif p_str:
+                        self.device_name = p_str
+                    else:
+                        raw_name = self.dll.rtlsdr_get_device_name(connected_idx)
+                        self.device_name = raw_name.decode("utf-8", errors="replace") if raw_name else "RTL2832U"
+                else:
+                    raw_name = self.dll.rtlsdr_get_device_name(connected_idx)
+                    self.device_name = raw_name.decode("utf-8", errors="replace") if raw_name else "RTL2832U"
+            except Exception:
+                self.device_name = "RTL-SDR Blog V4"
+
             self.status_detail = f"Hardware Active: {self.device_name}"
             
             # Configure initial SDR settings
@@ -145,6 +197,7 @@ class RtlSdrReceiver:
             self.dll.rtlsdr_reset_buffer(self.dev)
             return True
         else:
+            ret = last_ret
             # Check for blocking process like SatDump or SDR++
             blocking = detect_blocking_processes()
             if blocking:

@@ -44,11 +44,13 @@ typedef int (*pfn_rtlsdr_set_tuner_gain_mode)(void* dev, int manual);
 typedef int (*pfn_rtlsdr_set_tuner_gain)(void* dev, int gain);
 typedef int (*pfn_rtlsdr_reset_buffer)(void* dev);
 typedef int (*pfn_rtlsdr_read_sync)(void* dev, void* buf, int len, int* n_read);
+typedef int (*pfn_rtlsdr_get_device_usb_strings)(uint32_t index, char* manufact, char* product, char* serial);
 
 // Global RTL-SDR DLL functions
 static HMODULE g_hRtlsdrDll = NULL;
 static pfn_rtlsdr_get_device_count fn_get_device_count = NULL;
 static pfn_rtlsdr_get_device_name fn_get_device_name = NULL;
+static pfn_rtlsdr_get_device_usb_strings fn_get_device_usb_strings = NULL;
 static pfn_rtlsdr_open fn_open = NULL;
 static pfn_rtlsdr_close fn_close = NULL;
 static pfn_rtlsdr_set_center_freq fn_set_center_freq = NULL;
@@ -270,6 +272,7 @@ static bool load_rtlsdr_dll() {
             g_hRtlsdrDll = h;
             fn_get_device_count = (pfn_rtlsdr_get_device_count)GetProcAddress(h, "rtlsdr_get_device_count");
             fn_get_device_name = (pfn_rtlsdr_get_device_name)GetProcAddress(h, "rtlsdr_get_device_name");
+            fn_get_device_usb_strings = (pfn_rtlsdr_get_device_usb_strings)GetProcAddress(h, "rtlsdr_get_device_usb_strings");
             fn_open = (pfn_rtlsdr_open)GetProcAddress(h, "rtlsdr_open");
             fn_close = (pfn_rtlsdr_close)GetProcAddress(h, "rtlsdr_close");
             fn_set_center_freq = (pfn_rtlsdr_set_center_freq)GetProcAddress(h, "rtlsdr_set_center_freq");
@@ -651,14 +654,61 @@ DEMOD_API int tv_demod_connect() {
         return 0;
     }
 
-    if (fn_get_device_name) {
-        const char* name = fn_get_device_name(0);
-        if (name) strcpy_s(g_engine->device_name, sizeof(g_engine->device_name), name);
+    // Enumerate and select the target RTL-SDR device (prioritizing RTL-SDR Blog V4)
+    int target_idx = -1;
+    char target_serial[256] = { 0 };
+    char target_product[256] = { 0 };
+
+    for (uint32_t i = 0; i < cnt; i++) {
+        char mfg[256] = { 0 }, prd[256] = { 0 }, ser[256] = { 0 };
+        if (fn_get_device_usb_strings) {
+            fn_get_device_usb_strings(i, mfg, prd, ser);
+        }
+        const char* dname = fn_get_device_name ? fn_get_device_name(i) : "";
+        if ((dname && (strstr(dname, "Blog V4") || strstr(dname, "RTLSDRBlog"))) ||
+            strstr(prd, "Blog V4") || strstr(mfg, "RTLSDRBlog") || strstr(ser, "00000001")) {
+            target_idx = (int)i;
+            strcpy_s(target_product, sizeof(target_product), prd[0] ? prd : dname);
+            strcpy_s(target_serial, sizeof(target_serial), ser);
+            break;
+        }
+    }
+
+    // Try target index first, then remaining indices
+    std::vector<uint32_t> try_order;
+    if (target_idx >= 0) try_order.push_back((uint32_t)target_idx);
+    for (uint32_t i = 0; i < cnt; i++) {
+        if ((int)i != target_idx) try_order.push_back(i);
     }
 
     void* dev = NULL;
-    int ret = fn_open(&dev, 0);
-    if (ret == 0 && dev) {
+    int last_ret = -1;
+    int connected_idx = -1;
+
+    for (uint32_t idx : try_order) {
+        int ret = fn_open(&dev, idx);
+        if (ret == 0 && dev) {
+            connected_idx = (int)idx;
+            last_ret = 0;
+            break;
+        } else {
+            last_ret = ret;
+            dev = NULL;
+        }
+    }
+
+    if (dev && connected_idx >= 0) {
+        char mfg[256] = { 0 }, prd[256] = { 0 }, ser[256] = { 0 };
+        if (fn_get_device_usb_strings) {
+            fn_get_device_usb_strings((uint32_t)connected_idx, mfg, prd, ser);
+        }
+        if (prd[0] != '\0' && ser[0] != '\0') {
+            sprintf_s(g_engine->device_name, sizeof(g_engine->device_name), "%s #%s", prd, ser);
+        } else if (fn_get_device_name) {
+            const char* name = fn_get_device_name((uint32_t)connected_idx);
+            if (name) strcpy_s(g_engine->device_name, sizeof(g_engine->device_name), name);
+        }
+
         g_engine->sdr_dev = dev;
         g_engine->sdr_status = SDR_STATUS_CONNECTED;
         sprintf_s(g_engine->status_detail, sizeof(g_engine->status_detail), "Connected: %s", g_engine->device_name);
@@ -672,11 +722,12 @@ DEMOD_API int tv_demod_connect() {
         fn_reset_buffer(dev);
         return 1;
     } else {
+        int ret = last_ret;
         const char* err_hint = "USB open failed";
         if (ret == -1) err_hint = "USB I/O error (unplug & replug dongle)";
-        else if (ret == -3) err_hint = "Access denied (run Zadig WinUSB or Admin)";
+        else if (ret == -3) err_hint = "Access denied (close SDR++ / run Zadig WinUSB)";
         else if (ret == -5) err_hint = "Device not found / disconnected";
-        else if (ret == -6) err_hint = "Exclusive claim active (task in Task Manager)";
+        else if (ret == -6) err_hint = "Exclusive claim active (close SDR++ or Task Manager)";
         else if (ret == -12) err_hint = "WinUSB driver missing (install via Zadig)";
 
         if (ret == -6) {
