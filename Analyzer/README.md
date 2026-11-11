@@ -40,11 +40,11 @@ A high-performance radio astronomy analysis suite designed to process raw **CS16
 ### 1. Interactive Mode (Wizard)
 Simply run the script with no arguments:
 ```bash
-python Astro/run.py
+python Analyzer/run.py
 ```
-Or inside the `Astro` folder:
+Or inside the `Analyzer` folder:
 ```bash
-cd Astro
+cd Analyzer
 python run.py
 ```
 The wizard will:
@@ -58,29 +58,29 @@ The wizard will:
 ### 2. Command-Line (CLI) Mode
 Run fully automated with flags:
 ```bash
-python Astro/astro_analyzer.py <path_to_file.cs16> [options]
+python Analyzer/astro_analyzer.py <path_to_file.cs16> [options]
 ```
 
 #### Example Commands:
 
 - **Analyze a 2.4 MSPS file centered at 1420.5 MHz**:
   ```bash
-  python Astro/astro_analyzer.py SatDump/Astro/file5.cs16 --fc 1420.5MHz --fs 2.4MSPS
+  python Analyzer/astro_analyzer.py recordings/capture.cs16 --fc 1420.5MHz --fs 2.4MSPS
   ```
 
 - **Analyze the first 2 minutes (120 seconds) of an observation**:
   ```bash
-  python Astro/astro_analyzer.py file5.cs16 --fc 1420.5MHz --fs 2.4MSPS --duration 120
+  python Analyzer/astro_analyzer.py capture.cs16 --fc 1420.5MHz --fs 2.4MSPS --duration 120
   ```
 
 - **Use Asymmetric Least Squares (ALS) baseline modeling**:
   ```bash
-  python Astro/astro_analyzer.py file5.cs16 --fc 1420.5MHz --baseline als
+  python Analyzer/astro_analyzer.py capture.cs16 --fc 1420.5MHz --baseline als
   ```
 
 - **High-resolution 16384 FFT channels**:
   ```bash
-  python Astro/astro_analyzer.py file5.cs16 --fc 1420.5MHz --fft-size 16384
+  python Analyzer/astro_analyzer.py capture.cs16 --fc 1420.5MHz --fft-size 16384
   ```
 
 ---
@@ -96,11 +96,11 @@ python Astro/astro_analyzer.py <path_to_file.cs16> [options]
 | `-t` | `--duration` | Seconds to process (omit to process entire recording) | Full file |
 | `--baseline` | | Baseline fit algorithm (`ripple_filter`, `als`, `poly`) | `ripple_filter` |
 | `--tsys` | | System noise temperature in Kelvin for $T_A$ scaling | `100.0 K` |
-| `-o` | `--output-dir`| Custom directory to save output plots and reports | `Astro/output` |
+| `-o` | `--output-dir`| Custom directory to save output plots and reports | `Analyzer/output` |
 
 ---
 
-## Generated Files in `Astro/output/`
+## Generated Files in `Analyzer/output/`
 
 | Filename | Description |
 | :--- | :--- |

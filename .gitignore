@@ -11,6 +11,8 @@ SDRangel/
 *.cfile
 *.iq
 *.wav
+*.cs16
+recordings/
 
 # Python caches and virtual environments
 __pycache__/

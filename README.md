@@ -1,48 +1,34 @@
 # Radio
 
-A high-performance Software-Defined Radio (SDR) and Digital Signal Processing (DSP) observational pipeline for **21cm Neutral Hydrogen (H I) Line** radio astronomy ($\sim 1420.40575\text{ MHz}$).
+A complete high-performance Software-Defined Radio (SDR) and Digital Signal Processing (DSP) suite for **21cm Neutral Hydrogen (H I) Line** radio astronomy ($\sim 1420.40575\text{ MHz}$).
 
-Optimized for high-throughput streaming analysis of raw complex signed 16-bit integer (**CS16**) I/Q observations collected with amateur and professional radio telescopes using SDR receivers (e.g., RTL-SDR Blog V4/V3, Airspy, HackRF, SDRplay).
-
----
-
-## Key Features
-
-- **Blazing Fast Multithreaded Streaming Engine**:
-  - Leverages multithreaded `scipy.fft` with zero-copy NumPy buffers.
-  - Processes multi-gigabyte recordings at **> 100–180 MB/s** (25–45 MSamples/s), completing typical multi-minute observations in seconds.
-  - Streamed chunk-based I/O keeps RAM consumption strictly under **100 MB** regardless of recording size.
-- **Off-Center DC Offset Combating**:
-  - Direct conversion / Zero-IF SDRs suffer from central Local Oscillator (LO) leakage spikes.
-  - Full support for off-center tuning (e.g., `--fc 1420.5MHz` for a 2.4 MSPS RTL-SDR passband).
-  - The pipeline automatically detects the LO offset, validates separation from the H I rest line, and smoothly excises the residual DC spike.
-- **Advanced Two-Stage Baseline Modeling (Combats Coaxial Standing Waves)**:
-  - Radio telescope front-ends suffer from $\sim 700\text{ kHz}$ sinusoidal standing wave ripples caused by impedance reflections between the LNA and SDR coaxial cable.
-  - **Stage 1 (Passband Harmonic Fit)**: Adaptive Whittaker smoothing (ALS) or iterative Chebyshev polynomials fit the standing wave across the passband in log-space while downweighting digital filter skirts (outer 6.5%) and protecting the narrow H I window.
-  - **Stage 2 (Local Astronomical Zeroing)**: Performs local baseline detrending using line-free reference channels ($|v| > 40\text{ km/s}$), guaranteeing an exact **$0.000\text{ K}$ / $0.000\text{ dB}$ flat baseline** beneath the line with noise floor $\sigma \approx 0.5\text{ K}$.
-- **Kinematic & Physical Analysis**:
-  - Topocentric Doppler radial velocity mapping ($v = c \cdot \frac{f_0 - f}{f_0}$).
-  - Non-linear Gaussian emission profile fitting to extract peak velocity ($v_\text{peak}$), FWHM ($\Delta v_\text{FWHM}$), and velocity dispersion ($\sigma_v$).
-  - Integrated flux ($W = \int T_A dv$) and neutral hydrogen column density determination ($N_{HI} = 1.8224 \times 10^{18} W\text{ atoms/cm}^2$).
-- **Publication-Grade Visualizations**:
-  - Generates publication-ready figures including calibrated dual-axis spectra, raw bandpass vs. baseline models, Doppler velocity profiles, time-frequency waterfall spectrograms, and unified 4-panel executive dashboards.
-- **Multi-Format Structured Exports**:
-  - Calibrated CSV data tables, human-readable summary text reports, and machine-readable JSON metrics.
+Built specifically for amateur and professional radio astronomers using SDR receivers (e.g., RTL-SDR Blog V4, V3, Airspy, HackRF, SDRplay). The repository provides an integrated end-to-end workflow: real-time RF acquisition, spectrum and waterfall monitoring, lossless **CS16** binary recording, and high-throughput offline astrophysical analysis.
 
 ---
 
-## Directory Structure
+## Architecture Overview
 
 ```text
 Radio/
-├── Astro/                           # 21cm Neutral Hydrogen Line Radio Astronomy Pipeline
+├── Recorder/                        # SatDump-Style Live SDR Receiver & CS16 Capture App
+│   ├── app.py                       # Desktop GUI (Device, FFT controls, Recording, Waterfall)
+│   ├── sdr_stream.py                # Hardware RTL-SDR driver via ctypes (with Virtual SDR fallback)
+│   ├── cs16_writer.py               # Asynchronous high-speed CS16 binary stream recorder
+│   ├── run.py                       # Launcher for Desktop GUI and Headless CLI captures
+│   ├── launch.bat                   # 1-click Windows portable desktop launcher
+│   ├── rtlsdr.dll                   # Bundled 64-bit RTL-SDR hardware driver
+│   ├── libusb-1.0.dll               # Bundled 64-bit LibUSB backend
+│   └── README.md                    # Detailed Recorder documentation
+│
+├── Analyzer/                        # Offline 21cm Hydrogen Line Analysis Pipeline
 │   ├── astro_analyzer.py            # Core analysis runner & CLI engine
-│   ├── config.py                    # Astronomy pipeline configuration & physical constants
-│   ├── dsp.py                       # Multithreaded streaming FFT, PSD, & baseline fitting
-│   ├── exporter.py                  # Data export (CSV, JSON, ASCII reports)
-│   ├── run.py                       # Interactive CLI wizard launcher
-│   ├── visualizer.py                # Spectral plots, waterfalls, and observation dashboard
-│   ├── output/                      # Sample observation reports and visualizations
+│   ├── hydro_quick.py               # Lightweight 3-panel Matplotlib inspector
+│   ├── config.py                    # Pipeline configuration & astrophysical physical constants
+│   ├── dsp.py                       # Streaming FFT, PSD, DC excision, & ALS/Chebyshev baseline fitting
+│   ├── visualizer.py                # Publication-grade spectral plots, waterfalls, & dashboard
+│   ├── exporter.py                  # Structured exports (CSV, JSON, ASCII reports)
+│   ├── run.py                       # Interactive CLI analysis wizard launcher
+│   ├── output/                      # Analysis reports, plots, and calibrated data
 │   │   ├── 1_hi_spectrum_calibrated.png
 │   │   ├── 2_hi_raw_and_baseline.png
 │   │   ├── 3_hi_doppler_velocity.png
@@ -51,97 +37,71 @@ Radio/
 │   │   ├── analysis_report.json
 │   │   ├── analysis_report.txt
 │   │   └── calibrated_spectrum.csv
-│   └── README.md                    # Detailed astronomy pipeline documentation
+│   └── README.md                    # Detailed Analyzer documentation
 │
-└── .gitignore                       # Git rules ignoring local SDR suites & large recordings
+├── recordings/                      # Default capture folder for recorded .cs16 files (gitignored)
+└── .gitignore                       # Git rules ignoring local SDR installations & large recordings
 ```
 
 ---
 
-## Quick Start
+## 1. [Recorder: Live SDR Receiver & CS16 Capture App](./Recorder)
 
-### Prerequisites
+Styled after **SatDump**'s live receiver and recording panel, providing a lightweight, low-latency interface to tune, monitor, and record astronomical signals:
 
-Ensure you have Python 3.8+ installed with the following packages:
+- **Hardware Control**: Auto-detects connected RTL-SDR devices (e.g. `RTLSDRBlog Blog V4 #00000001`), configures sample rates (`1.024` to `3.2 Msps`), tunes center frequency with off-center LO offsets, sets manual/automatic gain (`0.0` to `49.6 dB`), and toggles **4.5V Bias-Tee** to power external LNAs (like Sawbird+ H1).
+- **Process Conflict Detection**: Automatically warns if an external SDR application (`satdump`, `sdrpp`, `sdrangel`) is holding the USB dongle and provides instant fallback to **Virtual SDR Simulation Mode**.
+- **Lossless CS16 Recording**: Writes raw I/Q samples to disk in SatDump-compatible **CS16** format (`int16` little-endian, 4 bytes/sample) on a dedicated background thread without dropped samples.
+- **Dynamic Stats**: Live monitoring of file size, remaining partition disk space, and estimated recording time left.
+- **Live Waterfall & Spectrum**: Real-time RF power curve and smooth 30–60 FPS scrolling waterfall with customizable palettes (`Classic [Youssef Touil]`, `Viridis`, `Turbo`, `Inferno`).
+- **Direct Integration**: Single-click button (`⚡ Open in Offline Analyzer`) to immediately analyze recorded files.
+
+### Launching the Recorder
+
+- **Desktop GUI**: Double-click `Recorder/launch.bat` or run:
+  ```bash
+  python Recorder/run.py
+  ```
+- **Automated Headless Recording**:
+  ```bash
+  python Recorder/run.py --cli --duration 120 --fc 1420.5M --fs 2.4M --gain 25.4 --bias-tee
+  ```
+
+---
+
+## 2. [Analyzer: Offline 21cm Hydrogen Line Analysis Pipeline](./Analyzer)
+
+A scientific-grade analysis suite engineered to process large raw **CS16** observations:
+
+- **High-Throughput Streaming Engine**: Processes multi-gigabyte recordings at **> 100–180 MB/s** (25–45 MSPS) while keeping RAM consumption strictly under **100 MB**.
+- **Off-Center DC Offset Combating**: Automatically detects the SDR LO offset, verifies separation from the H I rest line, and smoothly excises the residual DC spike.
+- **Two-Stage Baseline Modeling**: Neutralizes the $\sim 700\text{ kHz}$ coaxial standing wave ripples (impedance reflections between LNA and SDR) using Whittaker Asymmetric Least Squares (ALS) and Chebyshev polynomials.
+- **Astrophysical Kinematics**: Computes topocentric Doppler velocities ($v = c \cdot \frac{f_0 - f}{f_0}$), non-linear Gaussian line profile fits ($v_\text{peak}$, $\Delta v_\text{FWHM}$, $\sigma_v$), integrated line flux ($W$), and total neutral hydrogen column density ($N_{HI}$).
+- **Automated Visualizations**: Generates calibrated spectra, Doppler velocity profiles, time-frequency waterfalls, and executive multi-panel dashboards.
+
+### Running the Analyzer
+
+- **Interactive Wizard**:
+  ```bash
+  python Analyzer/run.py
+  ```
+- **Direct Command-Line (CLI)**:
+  ```bash
+  python Analyzer/astro_analyzer.py recordings/hi_capture.cs16 --fc 1420.5MHz --fs 2.4MSPS
+  ```
+- **Lightweight 3-Panel Matplotlib Viewer**:
+  ```bash
+  python Analyzer/hydro_quick.py recordings/hi_capture.cs16 --fc 1420.5M --fs 2.4M
+  ```
+
+---
+
+## Quick Installation & Requirements
+
+Ensure you have Python 3.8+ installed:
 
 ```bash
-pip install numpy scipy matplotlib
+pip install numpy scipy matplotlib pillow psutil
 ```
 
-### 1. Interactive Mode (Wizard)
-
-Run the wizard launcher directly without arguments:
-
-```bash
-python Astro/run.py
-```
-
-The interactive wizard will:
-1. Scan the repository workspace for available `.cs16` recordings.
-2. Prompt for your SDR Center LO frequency (default: `1420.5 MHz`).
-3. Prompt for SDR Sample Rate (default: `2.4 MSPS`, ideal for standard RTL-SDR bandwidth).
-4. Prompt for analysis duration (e.g. 120 seconds or full observation).
-
----
-
-### 2. Command-Line (CLI) Mode
-
-Run non-interactively with CLI arguments:
-
-```bash
-python Astro/astro_analyzer.py <path_to_file.cs16> [options]
-```
-
-#### Example Commands
-
-- **Analyze a 2.4 MSPS RTL-SDR recording centered at 1420.5 MHz**:
-  ```bash
-  python Astro/astro_analyzer.py observation.cs16 --fc 1420.5MHz --fs 2.4MSPS
-  ```
-
-- **Process the first 2 minutes (120 seconds) of an observation**:
-  ```bash
-  python Astro/astro_analyzer.py observation.cs16 --fc 1420.5MHz --fs 2.4MSPS --duration 120
-  ```
-
-- **Use Asymmetric Least Squares (ALS) baseline modeling**:
-  ```bash
-  python Astro/astro_analyzer.py observation.cs16 --fc 1420.5MHz --baseline als
-  ```
-
-- **High-resolution 16384-channel FFT**:
-  ```bash
-  python Astro/astro_analyzer.py observation.cs16 --fc 1420.5MHz --fft-size 16384
-  ```
-
----
-
-## Command-Line Arguments Reference
-
-| Option | Flag | Description | Default |
-| :--- | :--- | :--- | :--- |
-| `file` | Positional | Path to the raw CS16 file | Interactive Wizard |
-| `--fc` | `--center-freq` | SDR center LO frequency (`1420.5`, `1420.5MHz`, etc.) | `1420.5 MHz` |
-| `--fs` | `--sample-rate` | SDR sampling rate (`2.4`, `2.4MSPS`, `2400000`, etc.) | `2.4 MSPS` |
-| `-n` | `--fft-size` | Number of FFT bins (frequency channels) | `8192` |
-| `-t` | `--duration` | Seconds to process (omit to process entire recording) | Full file |
-| `--baseline` | | Baseline fit algorithm (`ripple_filter`, `als`, `poly`) | `ripple_filter` |
-| `--tsys` | | System noise temperature in Kelvin for $T_A$ scaling | `100.0 K` |
-| `-o` | `--output-dir`| Custom directory to save output plots and reports | `Astro/output` |
-
----
-
-## Output Artifacts
-
-Upon completion, all generated plots and data files are saved into `Astro/output/`:
-
-| Filename | Description |
-| :--- | :--- |
-| `1_hi_spectrum_calibrated.png` | Primary calibrated Hydrogen Line spectrum (velocity & frequency axes, Gaussian fit, HUD card) |
-| `2_hi_raw_and_baseline.png` | Raw SDR bandpass, baseline curve, DC spike excision marker, and protected bandpass zone |
-| `3_hi_doppler_velocity.png` | Doppler radial velocity profile showing galactic kinematics |
-| `4_hi_waterfall_time_frequency.png` | Time-frequency waterfall spectrogram demonstrating signal stability |
-| `5_hi_master_dashboard.png` | Unified 4-panel executive observation dashboard |
-| `calibrated_spectrum.csv` | Full CSV dataset of frequency, velocity, raw dB, baseline dB, calibrated dB, and Antenna Temp (K) |
-| `analysis_report.txt` | Human-readable scientific summary report |
-| `analysis_report.json` | Machine-readable JSON metrics and metadata |
+Bundled 64-bit `rtlsdr.dll` and `libusb-1.0.dll` drivers are included in `Recorder/` for Windows out-of-the-box operation.
