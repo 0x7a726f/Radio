@@ -39,6 +39,7 @@ cpp_analyzer/build*/
 cpp_analyzer/tests/bin/
 cpp_analyzer/test_output/
 cpp_analyzer/bin/imgui.ini
+analysis_results_*/
 
 # Editor and OS files
 .vscode/
