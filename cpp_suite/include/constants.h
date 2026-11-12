@@ -1,0 +1,126 @@
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+// ======================================================================
+// Real-time SDR & Receiver Constants
+// ======================================================================
+namespace SdrConstants {
+
+// Astronomical Neutral Hydrogen Line (21 cm spin-flip transition)
+constexpr double HI_REST_FREQ_HZ = 1420405751.786;
+constexpr uint64_t HI_REST_FREQ_ROUNDED_HZ = 1420405752ULL;
+constexpr double SPEED_OF_LIGHT_KM_S = 299792.458; // Speed of light in km/s
+
+// Default SDR parameters
+constexpr uint64_t DEFAULT_CENTER_FREQ_HZ = 1420500000ULL; // 1420.5 MHz (+94.248 kHz offset)
+constexpr uint32_t DEFAULT_SAMPLE_RATE_HZ = 2400000U;     // 2.4 MSPS
+constexpr float DEFAULT_GAIN_DB = 25.4f;
+constexpr bool DEFAULT_BIAS_TEE = false;
+constexpr int DEFAULT_PPM = 0;
+
+// Default DSP & Display parameters
+constexpr int DEFAULT_FFT_SIZE = 4096;
+constexpr float DEFAULT_FFT_MIN_DB = -105.0f;
+constexpr float DEFAULT_FFT_MAX_DB = -50.0f;
+constexpr float DEFAULT_AVG_FACTOR = 0.65f;
+constexpr int DEFAULT_WATERFALL_WIDTH = 800;
+constexpr int DEFAULT_WATERFALL_HEIGHT = 260;
+
+// Hardware buffer sizes
+constexpr size_t SDR_CHUNK_BYTES = 262144; // 128k complex uint8 samples (256 KB)
+constexpr size_t SDR_CHUNK_SAMPLES = SDR_CHUNK_BYTES / 2;
+constexpr size_t RING_BUFFER_CAPACITY = 32 * SDR_CHUNK_BYTES; // ~8 MB ring buffer
+
+// Presets
+struct BandPreset {
+    const char* name;
+    uint64_t freq_hz;
+};
+
+inline const std::vector<BandPreset>& GetPresets() {
+    static const std::vector<BandPreset> presets = {
+        {"H I 1420.5M (LO +94k)", 1420500000ULL},
+        {"H I 1420.406M (Rest Line)", 1420405752ULL},
+        {"H I 1420.2M (SatDump)", 1420206000ULL},
+        {"FM 89.2 MHz (Broadcast)", 89200000ULL},
+        {"FM 100.0 MHz (Broadcast)", 100000000ULL},
+        {"Airband 121.5 MHz (ATIS)", 121500000ULL},
+        {"Ham 144.8 MHz (2m APRS)", 144800000ULL},
+        {"ISM 433.92 MHz (Telemetry)", 433920000ULL},
+        {"ADS-B 1090.0 MHz (Aviation)", 1090000000ULL}
+    };
+    return presets;
+}
+
+struct SampleRateOption {
+    const char* label;
+    uint32_t rate_hz;
+};
+
+inline const std::vector<SampleRateOption>& GetSampleRates() {
+    static const std::vector<SampleRateOption> rates = {
+        {"1.024 Msps", 1024000U},
+        {"2.048 Msps", 2048000U},
+        {"2.4 Msps",   2400000U},
+        {"2.56 Msps",  2560000U},
+        {"3.2 Msps",   3200000U}
+    };
+    return rates;
+}
+
+inline const std::vector<int>& GetFftSizes() {
+    static const std::vector<int> sizes = {2048, 4096, 8192, 16384};
+    return sizes;
+}
+
+// Doppler velocity: v = c * (f0 - f) / f0
+inline double CalculateDopplerVelocityKmS(double observed_freq_hz) {
+    return SPEED_OF_LIGHT_KM_S * (HI_REST_FREQ_HZ - observed_freq_hz) / HI_REST_FREQ_HZ;
+}
+
+} // namespace SdrConstants
+
+
+// ======================================================================
+// Scientific Astrophysics & Analysis Constants
+// ======================================================================
+namespace astro {
+
+// Fundamental Physical and Astronomical Constants
+constexpr double HYDROGEN_REST_FREQ_HZ = 1420405751.768; // Exact HI 21cm line rest frequency (Hz)
+constexpr double HYDROGEN_REST_FREQ_MHZ = HYDROGEN_REST_FREQ_HZ / 1e6; // ~1420.405752 MHz
+constexpr double SPEED_OF_LIGHT_KMS = 299792.458; // Speed of light in vacuum (km/s)
+constexpr double SPEED_OF_LIGHT_MS = SPEED_OF_LIGHT_KMS * 1e3;
+
+// Neutral Hydrogen Column Density Conversion Factor (optically thin approximation)
+// N_HI = 1.8224e18 * integral(T_B * dv) in [atoms * cm^-2]
+// where T_B is brightness temperature in K, dv is velocity in km/s
+constexpr double HI_COLUMN_DENSITY_FACTOR = 1.8224e18;
+
+// Gaussian FWHM constant: FWHM = 2 * sqrt(2 * ln(2)) * sigma
+constexpr double GAUSSIAN_SIGMA_TO_FWHM = 2.3548200450309493;
+
+// SatDump-inspired UI Theme Palette (Hex RGBA & Floats)
+namespace theme {
+    // Primary deep background: #0F0F0FF0
+    constexpr float BG_R = 0.059f, BG_G = 0.059f, BG_B = 0.059f, BG_A = 0.941f;
+    // Frame & Child surface: #3336388A
+    constexpr float FRAME_R = 0.200f, FRAME_G = 0.212f, FRAME_B = 0.220f, FRAME_A = 0.541f;
+    // Primary Button / Header Accent: #3D85E0
+    constexpr float ACCENT_R = 0.239f, ACCENT_G = 0.522f, ACCENT_B = 0.878f, ACCENT_A = 1.0f;
+    // Cyan glow / Spectrum / Reticle: #66E6FFFF
+    constexpr float CYAN_R = 0.400f, CYAN_G = 0.902f, CYAN_B = 1.0f, CYAN_A = 1.0f;
+    // Danger / LO DC notch: #FF4757
+    constexpr float RED_R = 1.0f, RED_G = 0.278f, RED_B = 0.341f, RED_A = 1.0f;
+    // Emerald / Valid HI line: #10AC84 / #1DD1A1
+    constexpr float GREEN_R = 0.114f, GREEN_G = 0.820f, GREEN_B = 0.631f, GREEN_A = 1.0f;
+    // Warning / Baseline curve: #FF9F43
+    constexpr float ORANGE_R = 1.0f, ORANGE_G = 0.624f, ORANGE_B = 0.263f, ORANGE_A = 1.0f;
+    // Muted text / Grid: #8B949E
+    constexpr float MUTED_R = 0.545f, MUTED_G = 0.580f, MUTED_B = 0.620f, MUTED_A = 1.0f;
+}
+
+} // namespace astro

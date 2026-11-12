@@ -10,6 +10,16 @@ Built specifically for amateur and professional radio astronomers using SDR rece
 
 ```text
 Radio/
+├── cpp_suite/                       # UNIFIED C++ Radio Astronomy Desktop & CLI Suite (Record + Analyze)
+│   ├── bin/                         # Standalone binaries (radio_suite.exe, radio_suite_cli.exe, DLLs)
+│   ├── include/                     # Headers (ui_record_panel.h, ui_analyze_panel.h, app_state.h...)
+│   ├── src/                         # Implementations (unified GUI with bridge, CLI, DSP...)
+│   ├── tests/                       # Automated test harness & 115 assertions (run_tests.bat)
+│   ├── CMakeLists.txt               # Unified CMake configuration
+│   ├── build_mingw.bat              # 1-click build script (MinGW GCC 16.2.0 -O3 -mavx2)
+│   ├── build_msvc.bat               # 1-click build script (MSVC)
+│   └── README.md                    # Detailed Unified Suite documentation
+│
 ├── cpp_recorder/                    # High-Performance C++ Live SDR Receiver & CS16 Capture (SatDump UI & SIMD)
 │   ├── bin/                         # Standalone binaries (sdr_recorder_gui.exe, sdr_recorder_cli.exe, DLLs)
 │   ├── include/                     # Headers (simd_dsp.h, lockfree_ringbuffer.h, sdr_controller.h, app_gui.h...)

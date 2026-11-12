@@ -39,6 +39,11 @@ cpp_analyzer/build*/
 cpp_analyzer/tests/bin/
 cpp_analyzer/test_output/
 cpp_analyzer/bin/imgui.ini
+cpp_suite/build*/
+cpp_suite/output/
+cpp_suite/recordings/
+cpp_suite/bin/test_*
+cpp_suite/bin/imgui.ini
 analysis_results_*/
 
 # Editor and OS files
