@@ -35,6 +35,10 @@ build/
 cpp_recorder/tests_output/
 cpp_recorder/bin/tests/
 cpp_recorder/bin/imgui.ini
+cpp_analyzer/build*/
+cpp_analyzer/tests/bin/
+cpp_analyzer/test_output/
+cpp_analyzer/bin/imgui.ini
 
 # Editor and OS files
 .vscode/

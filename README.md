@@ -20,6 +20,16 @@ Radio/
 │   ├── build_msvc.bat               # 1-click build script (MSVC)
 │   └── README.md                    # Detailed C++ architecture & build documentation
 │
+├── cpp_analyzer/                    # Blazing Fast C++ Offline 21cm H I Analysis Pipeline & SatDump GUI
+│   ├── bin/                         # Standalone binaries (astro_analyzer_gui.exe, astro_analyzer_cli.exe)
+│   ├── include/                     # Headers (baseline_fitter.h, astrophysics.h, streaming_processor.h...)
+│   ├── src/                         # Implementations (baseline_fitter.cpp, plot_renderer.cpp, app_gui.cpp...)
+│   ├── tests/                       # Automated test harness & 19 unit tests (run_tests.bat)
+│   ├── CMakeLists.txt               # CMake configuration
+│   ├── build_mingw.bat              # 1-click build script (MinGW GCC 16.2.0 -O3 -mavx2)
+│   ├── build_msvc.bat               # 1-click build script (MSVC)
+│   └── README.md                    # Detailed C++ Analyzer documentation
+│
 ├── Recorder/                        # Python Live SDR Receiver & CS16 Capture App
 │   ├── app.py                       # Desktop GUI (Device, FFT controls, Recording, Waterfall)
 │   ├── sdr_stream.py                # Hardware RTL-SDR driver via ctypes (with Virtual SDR fallback)
