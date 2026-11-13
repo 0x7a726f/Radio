@@ -4,7 +4,7 @@
 
 namespace astro {
 
-static double calculate_median(std::vector<double> v) {
+static double calculate_median_inplace(std::vector<double>& v) {
     if (v.empty()) return 0.0;
     size_t n = v.size();
     size_t mid = n / 2;
@@ -12,8 +12,8 @@ static double calculate_median(std::vector<double> v) {
     if (n % 2 != 0) {
         return v[mid];
     } else {
-        std::nth_element(v.begin(), v.begin() + mid - 1, v.end());
-        return (v[mid - 1] + v[mid]) * 0.5;
+        auto left_max = std::max_element(v.begin(), v.begin() + mid);
+        return (*left_max + v[mid]) * 0.5;
     }
 }
 
@@ -31,26 +31,26 @@ std::vector<double> DCExcision::excise(const std::vector<double>& power, const A
     int start_dc = std::max(0, dc_bin - half_width_bins);
     int end_dc = std::min(nfft - 1, dc_bin + half_width_bins);
 
-    // Collect left guard samples
     int left_start = std::max(0, start_dc - guard_bins);
-    std::vector<double> left_guard;
-    for (int i = left_start; i < start_dc; ++i) {
-        left_guard.push_back(power[i]);
-    }
-
-    // Collect right guard samples
     int right_end = std::min(nfft, end_dc + 1 + guard_bins);
-    std::vector<double> right_guard;
-    for (int i = end_dc + 1; i < right_end; ++i) {
-        right_guard.push_back(power[i]);
-    }
 
-    std::vector<double> all_guards = left_guard;
+    std::vector<double> left_guard(power.begin() + left_start, power.begin() + start_dc);
+    std::vector<double> right_guard(power.begin() + end_dc + 1, power.begin() + right_end);
+
+    std::vector<double> all_guards;
+    all_guards.reserve(left_guard.size() + right_guard.size());
+    all_guards.insert(all_guards.end(), left_guard.begin(), left_guard.end());
     all_guards.insert(all_guards.end(), right_guard.begin(), right_guard.end());
 
-    double replacement_median = all_guards.empty() ? calculate_median(power) : calculate_median(all_guards);
-    double left_val = left_guard.empty() ? replacement_median : calculate_median(left_guard);
-    double right_val = right_guard.empty() ? replacement_median : calculate_median(right_guard);
+    double replacement_median = 0.0;
+    if (all_guards.empty()) {
+        std::vector<double> tmp = power;
+        replacement_median = calculate_median_inplace(tmp);
+    } else {
+        replacement_median = calculate_median_inplace(all_guards);
+    }
+    double left_val = left_guard.empty() ? replacement_median : calculate_median_inplace(left_guard);
+    double right_val = right_guard.empty() ? replacement_median : calculate_median_inplace(right_guard);
 
     int count = end_dc - start_dc + 1;
     if (count == 1) {

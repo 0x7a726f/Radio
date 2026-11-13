@@ -54,6 +54,7 @@ private:
 
     std::vector<float> power_raw_;
     std::vector<float> power_smooth_;
+    std::vector<float> telemetry_scratch_;
     bool has_smooth_ = false;
 
     // Telemetry state

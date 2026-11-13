@@ -1,9 +1,3 @@
-# External SDR suites and tools
-Orbitron/
-SatDump/
-SDR++/
-SDRangel/
-
 # Massive raw RF / IQ telescope recording files
 *.raw
 *.bin
@@ -12,38 +6,22 @@ SDRangel/
 *.iq
 *.wav
 *.cs16
-recordings/
 
-# Python caches and virtual environments
-__pycache__/
-*.py[cod]
-*$py.class
-*.pyd
-*.pyo
-venv/
-.venv/
-env/
-.env
-
-# MSVC and GCC compiler intermediate build artifacts
+# Compiler and CMake intermediate build artifacts
 *.obj
 *.o
 *.exp
 *.ilk
 *.pdb
 build/
-cpp_recorder/tests_output/
-cpp_recorder/bin/tests/
-cpp_recorder/bin/imgui.ini
-cpp_analyzer/build*/
-cpp_analyzer/tests/bin/
-cpp_analyzer/test_output/
-cpp_analyzer/bin/imgui.ini
 cpp_suite/build*/
 cpp_suite/output/
 cpp_suite/recordings/
+cpp_suite/bin/recordings/
 cpp_suite/bin/test_*
 cpp_suite/bin/imgui.ini
+cpp_suite/tests/test_tmp*/
+cpp_suite/tests/test_output*/
 analysis_results_*/
 
 # Editor and OS files

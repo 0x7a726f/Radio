@@ -1,9 +1,9 @@
 #pragma once
 
 #include "sdr_device.h"
-#include <random>
 #include <chrono>
 #include <atomic>
+#include <cstdint>
 
 class VirtualSdrDevice : public ISdrDevice {
 public:
@@ -47,10 +47,7 @@ private:
     std::atomic<bool> bias_tee_{false};
     std::atomic<int> ppm_{0};
 
-    uint64_t sample_counter_ = 0;
-    std::mt19937 rng_;
-    std::normal_distribution<float> noise_dist_{0.0f, 14.0f};
-    std::uniform_real_distribution<float> pulse_dist_{0.0f, 1.0f};
+    uint64_t rng_state_ = 0x9E3779B97F4A7C15ULL;
 
     // Phase accumulators for seamless phase continuity across tuning
     double hi_phase_ = 0.0;

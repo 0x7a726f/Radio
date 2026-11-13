@@ -244,12 +244,12 @@ SoftwareCanvas::SoftwareCanvas(int width, int height, PixelColor bg_color)
 }
 
 void SoftwareCanvas::clear(PixelColor color) {
-    for (int i = 0; i < width_ * height_; ++i) {
-        pixels_[i * 4 + 0] = color.r;
-        pixels_[i * 4 + 1] = color.g;
-        pixels_[i * 4 + 2] = color.b;
-        pixels_[i * 4 + 3] = color.a;
-    }
+    uint32_t packed = (static_cast<uint32_t>(color.a) << 24)
+                    | (static_cast<uint32_t>(color.b) << 16)
+                    | (static_cast<uint32_t>(color.g) << 8)
+                    | static_cast<uint32_t>(color.r);
+    uint32_t* dst = reinterpret_cast<uint32_t*>(pixels_.data());
+    std::fill_n(dst, static_cast<size_t>(width_) * height_, packed);
 }
 
 void SoftwareCanvas::set_pixel(int x, int y, PixelColor color) {
@@ -264,32 +264,45 @@ void SoftwareCanvas::set_pixel(int x, int y, PixelColor color) {
 void SoftwareCanvas::blend_pixel(int x, int y, PixelColor color) {
     if (x < 0 || x >= width_ || y < 0 || y >= height_) return;
     int idx = (y * width_ + x) * 4;
-    float a = color.a / 255.0f;
-    float inv_a = 1.0f - a;
-    pixels_[idx + 0] = static_cast<uint8_t>(color.r * a + pixels_[idx + 0] * inv_a);
-    pixels_[idx + 1] = static_cast<uint8_t>(color.g * a + pixels_[idx + 1] * inv_a);
-    pixels_[idx + 2] = static_cast<uint8_t>(color.b * a + pixels_[idx + 2] * inv_a);
+    const uint32_t a = color.a;
+    const uint32_t inv_a = 255u - a;
+    pixels_[idx + 0] = static_cast<uint8_t>((color.r * a + pixels_[idx + 0] * inv_a + 127u) / 255u);
+    pixels_[idx + 1] = static_cast<uint8_t>((color.g * a + pixels_[idx + 1] * inv_a + 127u) / 255u);
+    pixels_[idx + 2] = static_cast<uint8_t>((color.b * a + pixels_[idx + 2] * inv_a + 127u) / 255u);
 }
 
 static float fpart(float x) { return x - std::floor(x); }
 static float rfpart(float x) { return 1.0f - fpart(x); }
 
 void SoftwareCanvas::draw_line(int x0_i, int y0_i, int x1_i, int y1_i, PixelColor color, int thickness) {
-    // Pure horizontal or vertical lines: draw solid for crisp axes and boxes
+    // Pure horizontal or vertical lines: draw crisp spans respecting alpha
     if (x0_i == x1_i || y0_i == y1_i) {
         int x_min = std::min(x0_i, x1_i);
         int x_max = std::max(x0_i, x1_i);
         int y_min = std::min(y0_i, y1_i);
         int y_max = std::max(y0_i, y1_i);
         int rad = (thickness - 1) / 2;
+        const bool opaque = (color.a == 255);
 
         if (x0_i == x1_i) {
+            y_min = std::max(0, y_min);
+            y_max = std::min(height_ - 1, y_max);
             for (int y = y_min; y <= y_max; ++y) {
-                for (int rx = -rad; rx <= rad; ++rx) set_pixel(x0_i + rx, y, color);
+                for (int rx = -rad; rx <= rad; ++rx) {
+                    if (opaque) set_pixel(x0_i + rx, y, color);
+                    else blend_pixel(x0_i + rx, y, color);
+                }
             }
         } else {
-            for (int x = x_min; x <= x_max; ++x) {
-                for (int ry = -rad; ry <= rad; ++ry) set_pixel(x, y0_i + ry, color);
+            x_min = std::max(0, x_min);
+            x_max = std::min(width_ - 1, x_max);
+            for (int ry = -rad; ry <= rad; ++ry) {
+                int py = y0_i + ry;
+                if (py < 0 || py >= height_) continue;
+                for (int x = x_min; x <= x_max; ++x) {
+                    if (opaque) set_pixel(x, py, color);
+                    else blend_pixel(x, py, color);
+                }
             }
         }
         return;
@@ -482,23 +495,62 @@ void SoftwareCanvas::render_waterfall(
     if (rows <= 0 || cols <= 0 || dest_w <= 0 || dest_h <= 0) return;
     float range = vmax - vmin;
     if (range <= 1e-6f) range = 1.0f;
+    const float inv_range_255 = 255.0f / range;
 
-    for (int py = 0; py < dest_h; ++py) {
-        // origin="lower": py = 0 is time 0 (bottom)
-        int src_r = static_cast<int>((static_cast<float>(dest_h - 1 - py) / dest_h) * rows);
-        src_r = std::clamp(src_r, 0, rows - 1);
-        const float* row_ptr = &matrix[src_r * cols];
+    // Precompute 256-entry packed RGBA LUT for cmap
+    uint32_t lut[256];
+    for (int i = 0; i < 256; ++i) {
+        PixelColor c = sample_colormap(cmap, static_cast<float>(i) / 255.0f);
+        lut[i] = (static_cast<uint32_t>(c.a) << 24)
+               | (static_cast<uint32_t>(c.b) << 16)
+               | (static_cast<uint32_t>(c.g) << 8)
+               | static_cast<uint32_t>(c.r);
+    }
 
-        for (int px = 0; px < dest_w; ++px) {
-            int src_c = static_cast<int>((static_cast<float>(px) / dest_w) * cols);
-            src_c = std::clamp(src_c, 0, cols - 1);
+    // Precompute column source indices once outside py loop
+    std::vector<int> src_cols(dest_w);
+    const float col_scale = static_cast<float>(cols) / static_cast<float>(dest_w);
+    for (int px = 0; px < dest_w; ++px) {
+        src_cols[px] = std::clamp(static_cast<int>(px * col_scale), 0, cols - 1);
+    }
 
-            float val = row_ptr[src_c];
-            float norm = (val - vmin) / range;
-            PixelColor c = sample_colormap(cmap, norm);
-            set_pixel(dest_x + px, dest_y + py, c);
+    const int px_start = std::max(0, -dest_x);
+    const int px_end = std::min(dest_w, width_ - dest_x);
+    const int py_start = std::max(0, -dest_y);
+    const int py_end = std::min(dest_h, height_ - dest_y);
+    if (px_start >= px_end || py_start >= py_end) return;
+
+    uint32_t* canvas_px = reinterpret_cast<uint32_t*>(pixels_.data());
+    const float row_scale = static_cast<float>(rows) / static_cast<float>(dest_h);
+
+    for (int py = py_start; py < py_end; ++py) {
+        int src_r = std::clamp(static_cast<int>((dest_h - 1 - py) * row_scale), 0, rows - 1);
+        const float* row_ptr = &matrix[static_cast<size_t>(src_r) * cols];
+        uint32_t* dst_row = &canvas_px[static_cast<size_t>(dest_y + py) * width_ + dest_x];
+
+        for (int px = px_start; px < px_end; ++px) {
+            float norm = (row_ptr[src_cols[px]] - vmin) * inv_range_255;
+            int idx = static_cast<int>(norm);
+            if (idx < 0) idx = 0;
+            else if (idx > 255) idx = 255;
+            dst_row[px] = lut[idx];
         }
     }
+}
+
+static void compute_waterfall_percentiles(std::vector<float>& vals, float& vmin, float& vmax) {
+    if (vals.empty()) {
+        vmin = -1.0f;
+        vmax = 1.0f;
+        return;
+    }
+    const size_t n = vals.size();
+    const size_t i_lo = (n * 5) / 100;
+    const size_t i_hi = std::min(n - 1, (n * 995) / 1000);
+    std::nth_element(vals.begin(), vals.begin() + i_lo, vals.end());
+    vmin = vals[i_lo];
+    std::nth_element(vals.begin() + i_lo + 1, vals.begin() + i_hi, vals.end());
+    vmax = vals[i_hi] + 0.3f;
 }
 
 bool SoftwareCanvas::save_png(const std::string& filepath) const {
@@ -902,23 +954,24 @@ bool PlotRenderer::render_waterfall_plot(
     int sub_cols = std::max(1, c_end - c_start + 1);
 
     // Compute relative dB: 10 * log10(waterfall / baseline)
-    std::vector<float> sub_matrix(rows * sub_cols);
+    std::vector<float> sub_matrix(static_cast<size_t>(rows) * sub_cols);
+    std::vector<float> inv_base(sub_cols);
+    for (int sc = 0; sc < sub_cols; ++sc) {
+        inv_base[sc] = 1.0f / static_cast<float>(std::max(1e-12, baseline_power[c_start + sc]));
+    }
     for (int r = 0; r < rows; ++r) {
+        const float* wf_row = &waterfall_data[static_cast<size_t>(r) * cols + c_start];
+        float* dst_row = &sub_matrix[static_cast<size_t>(r) * sub_cols];
         for (int sc = 0; sc < sub_cols; ++sc) {
-            int c = c_start + sc;
-            double base_val = std::max(1e-12, baseline_power[c]);
-            float wf_val = waterfall_data[r * cols + c];
-            float rel_db = 10.0f * std::log10(std::max(1e-6f, wf_val / static_cast<float>(base_val)));
-            sub_matrix[r * sub_cols + sc] = rel_db;
+            dst_row[sc] = 10.0f * std::log10(std::max(1e-6f, wf_row[sc] * inv_base[sc]));
         }
     }
 
-    // Percentile scaling for contrast
+    // O(N) percentile scaling via nth_element
     if (sub_matrix.empty()) return false;
-    std::vector<float> sorted_vals = sub_matrix;
-    std::sort(sorted_vals.begin(), sorted_vals.end());
-    float vmin = sorted_vals[sorted_vals.size() * 5 / 100];
-    float vmax = sorted_vals[sorted_vals.size() * 995 / 1000] + 0.3f;
+    std::vector<float> scratch_vals = sub_matrix;
+    float vmin = 0.0f, vmax = 1.0f;
+    compute_waterfall_percentiles(scratch_vals, vmin, vmax);
 
     canvas.render_waterfall(sub_matrix.data(), rows, sub_cols, left, top, plot_w, plot_h, vmin, vmax, ColormapType::Magma);
     canvas.draw_rect(left, top, plot_w, plot_h, PixelColor(48, 54, 61), 1);
@@ -1084,20 +1137,22 @@ bool PlotRenderer::render_master_dashboard(
     }
     int sub_cols = std::max(1, c_end - c_start + 1);
 
-    std::vector<float> wf_sub(wf_rows * sub_cols);
+    std::vector<float> wf_sub(static_cast<size_t>(wf_rows) * sub_cols);
+    std::vector<float> inv_base(sub_cols);
+    for (int sc = 0; sc < sub_cols; ++sc) {
+        inv_base[sc] = 1.0f / static_cast<float>(std::max(1e-12, baseline_power[c_start + sc]));
+    }
     for (int r = 0; r < wf_rows; ++r) {
+        const float* wf_row = &waterfall_data[static_cast<size_t>(r) * wf_cols + c_start];
+        float* dst_row = &wf_sub[static_cast<size_t>(r) * sub_cols];
         for (int sc = 0; sc < sub_cols; ++sc) {
-            int c = c_start + sc;
-            double base_val = std::max(1e-12, baseline_power[c]);
-            float wf_val = waterfall_data[r * wf_cols + c];
-            wf_sub[r * sub_cols + sc] = 10.0f * std::log10(std::max(1e-6f, wf_val / static_cast<float>(base_val)));
+            dst_row[sc] = 10.0f * std::log10(std::max(1e-6f, wf_row[sc] * inv_base[sc]));
         }
     }
     if (wf_sub.empty()) return false;
-    std::vector<float> sorted_vals = wf_sub;
-    std::sort(sorted_vals.begin(), sorted_vals.end());
-    float vmin = sorted_vals[sorted_vals.size() * 5 / 100];
-    float vmax = sorted_vals[sorted_vals.size() * 995 / 1000] + 0.3f;
+    std::vector<float> scratch_vals = wf_sub;
+    float vmin = 0.0f, vmax = 1.0f;
+    compute_waterfall_percentiles(scratch_vals, vmin, vmax);
 
     canvas.render_waterfall(wf_sub.data(), wf_rows, sub_cols, q4_plot_x, q4_plot_y, q4_plot_w, q4_plot_h, vmin, vmax, ColormapType::Magma);
     canvas.draw_rect(q4_plot_x, q4_plot_y, q4_plot_w, q4_plot_h, PixelColor(48, 54, 61), 1);

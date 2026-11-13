@@ -62,7 +62,7 @@ g++ -std=c++17 -O3 -mavx2 -mfma -msse4.1 ^
     -static -static-libgcc -static-libstdc++ ^
     -mwindows ^
     -o bin/radio_suite.exe ^
-    -ld3d11 -ldxgi -ld3dcompiler -ldwmapi -lole32 -lkernel32 -luser32 -lgdi32 -lshell32 -lpsapi
+    -ld3d11 -ldxgi -ld3dcompiler -ldwmapi -lole32 -lkernel32 -luser32 -lgdi32 -lshell32 -lpsapi -lcomdlg32
 if %ERRORLEVEL% neq 0 (
     echo Error building GUI executable!
     if "%1" neq "--nopause" pause

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <cstdint>
 #include "config.h"
 
 namespace astro {
@@ -33,24 +34,24 @@ private:
     static std::vector<double> fit_als(
         const std::vector<double>& p_db,
         const std::vector<double>& freqs_mhz,
-        const std::vector<bool>& passband_mask,
-        const std::vector<bool>& hi_window,
+        const std::vector<uint8_t>& passband_mask,
+        const std::vector<uint8_t>& hi_window,
         const AstroConfig& config
     );
 
     static std::vector<double> fit_poly(
         const std::vector<double>& p_db,
         const std::vector<double>& freqs_mhz,
-        const std::vector<bool>& passband_mask,
-        const std::vector<bool>& hi_window,
+        const std::vector<uint8_t>& passband_mask,
+        const std::vector<uint8_t>& hi_window,
         const AstroConfig& config
     );
 
     static std::vector<double> fit_filter(
         const std::vector<double>& p_db,
         const std::vector<double>& freqs_mhz,
-        const std::vector<bool>& passband_mask,
-        const std::vector<bool>& hi_window,
+        const std::vector<uint8_t>& passband_mask,
+        const std::vector<uint8_t>& hi_window,
         const AstroConfig& config
     );
 };

@@ -7,8 +7,16 @@
 #include <mutex>
 #include <condition_variable>
 #include <queue>
+#include <deque>
 #include <atomic>
 #include <chrono>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 
 struct RecordingStats {
     std::string status;       // "IDLE" or "RECORDING"
@@ -48,6 +56,7 @@ public:
     RecordingStats get_stats();
     std::string get_current_filepath() const;
     std::string get_last_recorded_filepath() const;
+    const std::string& get_output_dir() const { return output_dir_; }
 
 private:
     void writer_worker();
@@ -73,14 +82,17 @@ private:
     std::atomic<uint64_t> bytes_written_{0};
     std::atomic<uint64_t> samples_written_{0};
     std::atomic<uint64_t> dropped_blocks_{0};
+    std::atomic<bool> sidecars_written_{false};
 
-    // Vectorized conversion lookup table: uint8 -> int16
-    int16_t lut_[256];
+#ifdef _WIN32
+    HANDLE file_handle_ = INVALID_HANDLE_VALUE;
+#endif
 
-    // Background disk writing queue
+    // Background disk writing queue and reusable block buffer pool
+    std::mutex lifecycle_mutex_;
     std::mutex queue_mutex_;
-    std::mutex stop_mutex_;
     std::condition_variable queue_cv_;
-    std::queue<std::vector<uint8_t>> write_queue_;
+    std::deque<std::vector<uint8_t>> write_queue_;
+    std::vector<std::vector<uint8_t>> free_pool_;
     std::thread writer_thread_;
 };

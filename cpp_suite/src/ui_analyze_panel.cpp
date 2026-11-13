@@ -1,97 +1,125 @@
 #include "ui_analyze_panel.h"
-#include "../lib/imgui/imgui.h"
-#include "constants.h"
-#include "dc_excision.h"
-#include "rfi_filter.h"
 #include "baseline_fitter.h"
 #include "exporter.h"
+#include "rfi_filter.h"
+#include "simd_dsp.h"
 
-#include <cmath>
 #include <algorithm>
-#include <sstream>
-#include <iomanip>
+#include <cmath>
+#include <cstdio>
 #include <filesystem>
-#include <iostream>
+
+namespace fs = std::filesystem;
 
 namespace astro {
 
-static const int FFT_SIZES[] = {2048, 4096, 8192, 16384, 32768};
-static const char* FFT_SIZE_NAMES[] = {"2048 bins", "4096 bins", "8192 bins (Default)", "16384 bins", "32768 bins"};
-static const char* BASELINE_NAMES[] = {"Ripple Filter (Recommended)", "Asymmetric Least Squares (ALS)", "Polynomial Fit (Degree 10)"};
-static const char* COLORMAP_NAMES[] = {"Magma / Inferno (Default)", "Viridis (Perceptual)", "Turbo (High Dynamic Range)", "Classic (Rainbow)"};
+namespace {
+
+static std::string get_exe_parent_output_dir() {
+    fs::path dir = ui_obs::win_fs::get_exe_dir() / "output";
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    return dir.string();
+}
+
+static void build_normalized_waterfall(const StreamingResults& stream,
+                                       int& out_w, int& out_h,
+                                       std::vector<uint8_t>& out_u8,
+                                       double& out_vmin_db, double& out_vmax_db) {
+    out_w = 0;
+    out_h = 0;
+    out_u8.clear();
+    out_vmin_db = -10.0;
+    out_vmax_db = 10.0;
+
+    const int src_r = stream.waterfall_rows;
+    const int src_c = stream.waterfall_cols;
+    if (src_r <= 0 || src_c <= 0 || stream.waterfall_data.size() < static_cast<size_t>(src_r) * src_c) {
+        return;
+    }
+
+    // Estimate median passband reference power for relative dB scale
+    std::vector<double> valid_p;
+    valid_p.reserve(stream.averaged_power.size());
+    for (double p : stream.averaged_power) {
+        if (std::isfinite(p) && p > 1e-18) valid_p.push_back(p);
+    }
+    double ref_power = 1.0;
+    if (!valid_p.empty()) {
+        size_t mid = valid_p.size() / 2;
+        std::nth_element(valid_p.begin(), valid_p.begin() + mid, valid_p.end());
+        ref_power = std::max(valid_p[mid], 1e-18);
+    }
+    const double inv_ref = 1.0 / ref_power;
+
+    // Downsample cleanly within DX11 safe texture caps (<= 2048 x 1024)
+    out_w = std::min(src_c, 2048);
+    out_h = std::min(src_r, 1024);
+
+    std::vector<double> rel_db(static_cast<size_t>(out_w) * static_cast<size_t>(out_h), 0.0);
+    for (int r = 0; r < out_h; ++r) {
+        int r0 = static_cast<int>((static_cast<double>(r) / out_h) * src_r);
+        int r1 = std::max(r0 + 1, static_cast<int>((static_cast<double>(r + 1) / out_h) * src_r));
+        r1 = std::min(r1, src_r);
+
+        for (int c = 0; c < out_w; ++c) {
+            int c0 = static_cast<int>((static_cast<double>(c) / out_w) * src_c);
+            int c1 = std::max(c0 + 1, static_cast<int>((static_cast<double>(c + 1) / out_w) * src_c));
+            c1 = std::min(c1, src_c);
+
+            // Max-pool over sub-bins so narrow H I/RFI peaks remain crisp when downsampled
+            double peak_val = 0.0;
+            for (int sr = r0; sr < r1; ++sr) {
+                const float* row_ptr = stream.waterfall_data.data() + static_cast<size_t>(sr) * src_c;
+                for (int sc = c0; sc < c1; ++sc) {
+                    double v = static_cast<double>(row_ptr[sc]);
+                    if (v > peak_val) peak_val = v;
+                }
+            }
+            rel_db[static_cast<size_t>(r) * out_w + c] = 10.0 * std::log10(std::max(peak_val * inv_ref, 1e-12));
+        }
+    }
+
+    // Compute 5th .. 99.5th percentile contrast window in O(N)
+    std::vector<double> sorted_vals = rel_db;
+    const size_t n = sorted_vals.size();
+    const size_t idx_low = static_cast<size_t>(0.05 * static_cast<double>(n - 1));
+    const size_t idx_high = static_cast<size_t>(0.995 * static_cast<double>(n - 1));
+    std::nth_element(sorted_vals.begin(), sorted_vals.begin() + idx_low, sorted_vals.end());
+    out_vmin_db = sorted_vals[idx_low];
+    std::nth_element(sorted_vals.begin() + idx_low, sorted_vals.begin() + idx_high, sorted_vals.end());
+    out_vmax_db = std::max(out_vmin_db + 1.0, sorted_vals[idx_high]);
+
+    const double inv_span = 255.0 / (out_vmax_db - out_vmin_db);
+    out_u8.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        double scaled = (rel_db[i] - out_vmin_db) * inv_span;
+        out_u8[i] = static_cast<uint8_t>(std::clamp(scaled, 0.0, 255.0));
+    }
+}
+
+} // namespace
 
 UiAnalyzePanel::UiAnalyzePanel(AppState& app_state)
-    : app_state_(app_state) {
+    : app_state_(app_state)
+{
+    active_lut256_ = ui_obs::build_colormap_lut256(ui_colormap_idx_);
     scan_files();
+    if (!discovered_files_.empty()) {
+        on_file_selected(discovered_files_[0]);
+        selected_file_idx_ = 0;
+    }
 }
 
 UiAnalyzePanel::~UiAnalyzePanel() {
-    cancel_analysis();
-    if (export_thread_ && export_thread_->joinable()) {
-        export_thread_->join();
-    }
-    release_d3d_resources();
-}
-
-void UiAnalyzePanel::cancel_analysis() {
     cancel_requested_ = true;
     if (worker_thread_ && worker_thread_->joinable()) {
         worker_thread_->join();
     }
-}
-
-void UiAnalyzePanel::scan_files() {
-    std::vector<std::string> search_dirs = {
-        ".",
-        "recordings",
-        "../recordings",
-        "cpp_recorder/recordings",
-        "../cpp_recorder/recordings",
-        "Analyzer",
-        "../Analyzer"
-    };
-    discovered_files_ = SidecarReader::scan_cs16_files(search_dirs);
-    if (!discovered_files_.empty() && selected_file_idx_ < 0) {
-        selected_file_idx_ = 0;
-        on_file_selected(discovered_files_[0]);
+    if (export_thread_ && export_thread_->joinable()) {
+        export_thread_->join();
     }
-}
-
-void UiAnalyzePanel::on_file_selected(const std::string& path) {
-    if (path.empty()) return;
-    current_sidecar_ = SidecarReader::parse(path);
-    if (current_sidecar_.found_sidecar) {
-        SidecarReader::apply_to_config(current_sidecar_, config_);
-        ui_center_freq_mhz_ = config_.center_freq_hz / 1e6;
-        ui_sample_rate_msps_ = config_.sample_rate_hz / 1e6;
-    }
-    status_message_ = "Loaded: " + std::filesystem::path(path).filename().string();
-}
-
-void UiAnalyzePanel::select_and_run_file(const std::string& path, bool auto_run) {
-    if (path.empty()) return;
-
-    // Check if already in list
-    int found_idx = -1;
-    for (size_t i = 0; i < discovered_files_.size(); ++i) {
-        if (std::filesystem::equivalent(path, discovered_files_[i])) {
-            found_idx = static_cast<int>(i);
-            break;
-        }
-    }
-
-    if (found_idx >= 0) {
-        selected_file_idx_ = found_idx;
-    } else {
-        discovered_files_.insert(discovered_files_.begin(), path);
-        selected_file_idx_ = 0;
-    }
-
-    on_file_selected(path);
-
-    if (auto_run) {
-        start_analysis();
-    }
+    release_d3d_resources();
 }
 
 void UiAnalyzePanel::init_d3d_resources(ID3D11Device* device) {
@@ -99,29 +127,987 @@ void UiAnalyzePanel::init_d3d_resources(ID3D11Device* device) {
 }
 
 void UiAnalyzePanel::release_d3d_resources() {
-    if (waterfall_srv_) { waterfall_srv_->Release(); waterfall_srv_ = nullptr; }
-    if (waterfall_texture_) { waterfall_texture_->Release(); waterfall_texture_ = nullptr; }
+    if (waterfall_srv_) {
+        waterfall_srv_->Release();
+        waterfall_srv_ = nullptr;
+    }
+    if (waterfall_texture_) {
+        waterfall_texture_->Release();
+        waterfall_texture_ = nullptr;
+    }
     tex_width_ = 0;
     tex_height_ = 0;
+    last_uploaded_snap_ = nullptr;
 }
 
-void UiAnalyzePanel::update_waterfall_texture(ID3D11DeviceContext* ctx) {
-    if (!d3d_device_ || !ctx || !has_results_ || stream_res_.waterfall_rows <= 0 || stream_res_.waterfall_cols <= 0) return;
+std::shared_ptr<const AnalysisSnapshot> UiAnalyzePanel::get_snapshot() {
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    return active_snapshot_;
+}
 
-    int rows = stream_res_.waterfall_rows;
-    int cols = stream_res_.waterfall_cols;
-    if (rows <= 0 || cols <= 0 || baseline_power_.size() < static_cast<size_t>(cols)) return;
+std::string UiAnalyzePanel::get_status_message() {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    return status_message_;
+}
 
-    if (!waterfall_texture_dirty_ && waterfall_texture_ && ui_colormap_idx_ == last_colormap_idx_) {
-        return; // Already up to date! Skip re-rendering to keep 60 FPS buttery smooth.
+void UiAnalyzePanel::set_status_message(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    status_message_ = msg;
+}
+
+std::string UiAnalyzePanel::get_export_message() {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    return export_status_msg_;
+}
+
+void UiAnalyzePanel::set_export_message(const std::string& msg) {
+    std::lock_guard<std::mutex> lock(status_mutex_);
+    export_status_msg_ = msg;
+}
+
+void UiAnalyzePanel::scan_files() {
+    std::vector<std::string> search_dirs = {
+        ui_obs::win_fs::get_default_recordings_dir(),
+        "recordings",
+        "bin/recordings",
+        "../recordings",
+        "."
+    };
+
+    if (custom_file_path_[0] != '\0') {
+        std::error_code ec;
+        fs::path p(custom_file_path_);
+        if (p.has_parent_path() && fs::exists(p.parent_path(), ec)) {
+            search_dirs.push_back(p.parent_path().string());
+        }
     }
 
-    if (!waterfall_texture_ || tex_width_ != cols || tex_height_ != rows) {
-        release_d3d_resources();
+    discovered_files_ = SidecarReader::scan_cs16_files(search_dirs);
 
-        D3D11_TEXTURE2D_DESC desc = {};
-        desc.Width = cols;
-        desc.Height = rows;
+    // Resync selected_file_idx_ cleanly without unsafe equivalent() exceptions
+    selected_file_idx_ = -1;
+    if (custom_file_path_[0] != '\0') {
+        std::error_code ec;
+        fs::path cur_can = fs::weakly_canonical(fs::path(custom_file_path_), ec);
+        for (size_t i = 0; i < discovered_files_.size(); ++i) {
+            std::error_code ec2;
+            fs::path cand = fs::weakly_canonical(fs::path(discovered_files_[i]), ec2);
+            if ((!ec && !ec2 && cur_can == cand) || discovered_files_[i] == custom_file_path_) {
+                selected_file_idx_ = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+}
+
+void UiAnalyzePanel::select_and_run_file(const std::string& path, bool auto_run) {
+    scan_files();
+    on_file_selected(path);
+
+    selected_file_idx_ = -1;
+    std::error_code ec;
+    fs::path target_can = fs::weakly_canonical(fs::path(path), ec);
+    for (size_t i = 0; i < discovered_files_.size(); ++i) {
+        std::error_code ec2;
+        fs::path cand = fs::weakly_canonical(fs::path(discovered_files_[i]), ec2);
+        if ((!ec && !ec2 && target_can == cand) || discovered_files_[i] == path) {
+            selected_file_idx_ = static_cast<int>(i);
+            break;
+        }
+    }
+
+    if (auto_run) {
+        start_analysis();
+    }
+}
+
+void UiAnalyzePanel::on_file_selected(const std::string& path) {
+    std::snprintf(custom_file_path_, sizeof(custom_file_path_), "%s", path.c_str());
+
+    current_sidecar_ = SidecarReader::parse(path);
+    if (current_sidecar_.found_sidecar || current_sidecar_.center_freq_hz > 0.0) {
+        if (current_sidecar_.center_freq_hz > 0.0) {
+            ui_center_freq_mhz_ = current_sidecar_.center_freq_hz / 1e6;
+        }
+        if (current_sidecar_.sample_rate_hz > 0.0) {
+            ui_sample_rate_msps_ = current_sidecar_.sample_rate_hz / 1e6;
+        }
+        if (current_sidecar_.found_sidecar) {
+            set_status_message("Loaded sidecar metadata (" + current_sidecar_.sidecar_source + "). Ready.");
+        } else {
+            set_status_message("Parsed metadata from filename. Ready.");
+        }
+    } else {
+        set_status_message("Selected file. Verify LO / Sample Rate and run H I pipeline.");
+    }
+}
+
+AnalyzeParamsSig UiAnalyzePanel::current_signature() const {
+    AnalyzeParamsSig sig;
+    sig.filepath = custom_file_path_;
+    sig.center_freq_mhz = ui_center_freq_mhz_;
+    sig.sample_rate_msps = ui_sample_rate_msps_;
+    sig.fft_size_idx = ui_fft_size_idx_;
+    sig.baseline_idx = ui_baseline_idx_;
+    sig.tsys_k = ui_tsys_k_;
+    sig.duration_s = ui_duration_s_;
+    sig.dc_clear_khz = ui_dc_clear_khz_;
+    sig.als_lambda = static_cast<double>(ui_als_lambda_);
+    sig.als_p = static_cast<double>(ui_als_p_);
+    sig.poly_degree = ui_poly_deg_;
+    return sig;
+}
+
+bool UiAnalyzePanel::validate_inputs(std::string& out_error) const {
+    std::string target = custom_file_path_;
+    if (target.empty()) {
+        out_error = "Select a .cs16 file first.";
+        return false;
+    }
+    if (app_state_.is_file_actively_recording(target)) {
+        out_error = "File is currently being written by Live Recorder.";
+        return false;
+    }
+    std::error_code ec;
+    if (!fs::exists(target, ec) || fs::is_directory(target, ec)) {
+        out_error = "Input .cs16 file does not exist on disk.";
+        return false;
+    }
+    if (ui_center_freq_mhz_ < 1.0 || ui_center_freq_mhz_ > 6000.0) {
+        out_error = "Center frequency must be between 1 and 6000 MHz.";
+        return false;
+    }
+    if (ui_sample_rate_msps_ < 0.1 || ui_sample_rate_msps_ > 20.0) {
+        out_error = "Sample rate must be between 0.1 and 20.0 MSPS.";
+        return false;
+    }
+    if (ui_tsys_k_ < 1.0f) {
+        out_error = "System Temperature T_sys must be >= 1.0 K.";
+        return false;
+    }
+    return true;
+}
+
+std::string UiAnalyzePanel::get_output_dir_for_source(const std::string& src_path) const {
+    std::string stem = fs::path(src_path).stem().string();
+    if (stem.empty()) stem = "analysis";
+    fs::path out_dir = fs::path(get_exe_parent_output_dir()) / stem;
+    std::error_code ec;
+    fs::create_directories(out_dir, ec);
+    return out_dir.string();
+}
+
+void UiAnalyzePanel::start_analysis() {
+    if (is_analyzing_.load()) return;
+
+    std::string err;
+    if (!validate_inputs(err)) {
+        set_status_message("Blocked: " + err);
+        return;
+    }
+
+    if (worker_thread_ && worker_thread_->joinable()) {
+        worker_thread_->join();
+    }
+
+    static constexpr int fft_choices[] = {2048, 4096, 8192, 16384, 32768};
+    AstroConfig run_cfg = config_;
+    run_cfg.center_freq_hz = ui_center_freq_mhz_ * 1e6;
+    run_cfg.sample_rate_hz = ui_sample_rate_msps_ * 1e6;
+    run_cfg.fft_size = fft_choices[std::clamp(ui_fft_size_idx_, 0, 4)];
+    run_cfg.system_temp_k = static_cast<double>(ui_tsys_k_);
+    run_cfg.max_duration_s = static_cast<double>(ui_duration_s_);
+    run_cfg.dc_clear_hz = static_cast<double>(ui_dc_clear_khz_) * 1000.0;
+    run_cfg.als_lambda = static_cast<double>(ui_als_lambda_);
+    run_cfg.als_p = static_cast<double>(ui_als_p_);
+    run_cfg.poly_degree = std::clamp(ui_poly_deg_, 2, 20);
+    run_cfg.verbose = false;
+    run_cfg.baseline_method = (ui_baseline_idx_ == 1) ? BaselineMethod::ALS
+                            : (ui_baseline_idx_ == 2) ? BaselineMethod::Poly
+                                                      : BaselineMethod::RippleFilter;
+
+    const std::string target_file = custom_file_path_;
+    const AnalyzeParamsSig run_sig = current_signature();
+    run_cfg.output_dir = get_output_dir_for_source(target_file);
+
+    cancel_requested_ = false;
+    is_analyzing_ = true;
+    progress_pct_ = 0.0;
+    progress_speed_ = 0.0;
+    progress_eta_ = 0.0;
+    set_status_message("Streaming FFT Accumulation (AVX2 + FMA)...");
+    set_export_message("");
+
+    worker_thread_ = std::make_unique<std::thread>([this, target_file, run_cfg, run_sig]() {
+        try {
+            StreamingProcessor processor(target_file, run_cfg);
+            processor.set_cancel_token(&cancel_requested_);
+
+            auto snap = std::make_shared<AnalysisSnapshot>();
+            snap->source_filepath = target_file;
+            snap->config_used = run_cfg;
+            snap->stream = processor.process([this](double pct, double mbps, double eta) {
+                progress_pct_.store(pct);
+                progress_speed_.store(mbps);
+                progress_eta_.store(eta);
+            });
+
+            if (cancel_requested_.load() || snap->stream.averaged_power.empty()) {
+                set_status_message(cancel_requested_.load() ? "Analysis cancelled." : "Analysis failed: empty stream.");
+                is_analyzing_ = false;
+                return;
+            }
+
+            set_status_message("DC Excision, RFI Mitigation & Baseline Fit...");
+            DCExcisionInfo dc_info;
+            auto dc_clean = DCExcision::excise(snap->stream.averaged_power, run_cfg, dc_info);
+
+            int num_rfi = 0;
+            snap->rfi_clean_power = RFIFilter::mitigate(dc_clean, snap->stream.freq_mhz, run_cfg, num_rfi);
+
+            // Precompute log10 dB passband once on worker thread for zero-cost GUI plotting
+            snap->raw_db.resize(snap->rfi_clean_power.size());
+            SimdDsp::power_to_db_f64(snap->rfi_clean_power.data(), snap->raw_db.data(), snap->rfi_clean_power.size());
+
+            auto base_res = BaselineFitter::fit(snap->rfi_clean_power, snap->stream.freq_mhz, run_cfg);
+            snap->baseline_power = std::move(base_res.baseline_power);
+            snap->baseline_db = std::move(base_res.baseline_db);
+
+            const size_t n = snap->rfi_clean_power.size();
+            snap->calibrated_k.resize(n);
+            snap->calibrated_db.resize(n);
+            for (size_t i = 0; i < n; ++i) {
+                double bp = std::max(snap->baseline_power[i], 1e-18);
+                double ratio = std::max(snap->rfi_clean_power[i] / bp, 1e-12);
+                snap->calibrated_k[i] = run_cfg.system_temp_k * (ratio - 1.0);
+                snap->calibrated_db[i] = 10.0 * std::log10(ratio);
+            }
+
+            snap->vel_kms = Astrophysics::compute_doppler_velocity(snap->stream.freq_hz);
+
+            double local_slope = 0.0, local_intercept = 0.0;
+            BaselineFitter::refine_local(snap->vel_kms, snap->calibrated_k, snap->calibrated_db,
+                                         run_cfg, local_slope, local_intercept);
+
+            snap->metrics = Astrophysics::calculate_metrics(
+                snap->stream.freq_mhz, snap->vel_kms, snap->calibrated_k, snap->calibrated_db, run_cfg);
+
+            set_status_message("Building Normalized Waterfall Texture...");
+            build_normalized_waterfall(snap->stream, snap->wf_tex_w, snap->wf_tex_h,
+                                       snap->wf_norm_u8, snap->wf_vmin_db, snap->wf_vmax_db);
+            snap->wf_duration_s = snap->stream.total_duration_s;
+
+            {
+                std::lock_guard<std::mutex> lock(snapshot_mutex_);
+                active_snapshot_ = snap;
+                last_run_sig_ = run_sig;
+            }
+
+            char done_msg[256];
+            std::snprintf(done_msg, sizeof(done_msg),
+                          "Done in %.2fs (%.0f MB/s) | Peak: %.4f MHz (%.2f K, %.2f sigma)",
+                          snap->stream.elapsed_processing_time_s,
+                          snap->stream.throughput_mb_s,
+                          snap->metrics.peak_freq_mhz,
+                          snap->metrics.peak_temp_k,
+                          snap->metrics.snr);
+            set_status_message(done_msg);
+        } catch (const std::exception& ex) {
+            set_status_message(std::string("Pipeline error: ") + ex.what());
+        }
+        is_analyzing_ = false;
+    });
+}
+
+void UiAnalyzePanel::cancel_analysis() {
+    if (is_analyzing_.load()) {
+        cancel_requested_ = true;
+        set_status_message("Cancelling streaming worker...");
+    }
+}
+
+void UiAnalyzePanel::start_export(const std::shared_ptr<const AnalysisSnapshot>& snap) {
+    if (!snap || is_exporting_.load() || is_analyzing_.load()) return;
+
+    if (export_thread_ && export_thread_->joinable()) {
+        export_thread_->join();
+    }
+
+    is_exporting_ = true;
+    set_export_message("Exporting 8 scientific artifacts...");
+
+    export_thread_ = std::make_unique<std::thread>([this, snap]() {
+        FileMetadata meta;
+        meta.filepath = snap->source_filepath;
+        meta.filesize = snap->stream.file_size_bytes;
+        meta.total_samples = snap->stream.total_samples;
+        meta.duration_s = snap->stream.total_duration_s;
+        meta.processing_time_s = snap->stream.elapsed_processing_time_s;
+        meta.throughput_mb_s = snap->stream.throughput_mb_s;
+
+        std::string out_dir = get_output_dir_for_source(snap->source_filepath);
+        bool ok = Exporter::export_all_artifacts(
+            out_dir, snap->source_filepath, snap->config_used, meta,
+            snap->stream, snap->rfi_clean_power, snap->baseline_power,
+            snap->calibrated_k, snap->calibrated_db, snap->metrics);
+
+        set_export_message(ok ? ("Exported 8 artifacts to " + out_dir)
+                              : "Export failed (check write permissions).");
+        is_exporting_ = false;
+    });
+}
+
+void UiAnalyzePanel::render_panel(ID3D11DeviceContext* ctx, float width, float height) {
+    auto snap = get_snapshot();
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(10.0f, 8.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8.0f, 8.0f));
+    ImGui::BeginChild("##AnalyzeRoot", ImVec2(width, height), false,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    const float inner_w = width - 20.0f;
+    const float top_h = 50.0f;
+    render_top_bar(inner_w, top_h, snap);
+
+    const float rem_h = std::max(120.0f, height - top_h - 24.0f);
+    const float sidebar_w = std::min(310.0f, std::max(260.0f, inner_w * 0.24f));
+    const float main_w = std::max(260.0f, inner_w - sidebar_w - 8.0f);
+
+    render_sidebar_controls(sidebar_w, rem_h, snap);
+    ImGui::SameLine();
+
+    ImGui::BeginChild("##AnalyzeMainCol", ImVec2(main_w, rem_h), false,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    // Non-occluding Pinned KPI Strip + Stale-Parameter Banner
+    if (snap) {
+        // Stale parameter detection
+        bool params_dirty = false;
+        {
+            std::lock_guard<std::mutex> lock(snapshot_mutex_);
+            params_dirty = (current_signature() != last_run_sig_);
+        }
+        if (params_dirty && !is_analyzing_.load()) {
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(ui_obs::palette::Amber.x, ui_obs::palette::Amber.y, ui_obs::palette::Amber.z, 0.14f));
+            ImGui::PushStyleColor(ImGuiCol_Border, ui_obs::palette::Amber);
+            ImGui::BeginChild("##StaleBanner", ImVec2(main_w, 28.0f), true, ImGuiWindowFlags_NoScrollbar);
+            ImGui::SetCursorPosY(5.0f);
+            ImGui::TextColored(ui_obs::palette::Amber,
+                               "Configuration changed since last run - Click 'Run H I Pipeline' to recompute.");
+            ImGui::EndChild();
+            ImGui::PopStyleColor(2);
+        }
+
+        render_kpi_strip(main_w, snap->metrics, snap->config_used);
+    }
+
+    // Tabs Viewport
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui_obs::palette::Surface);
+    ImGui::BeginChild("##AnalyzePlotArea", ImVec2(main_w, std::max(100.0f, ImGui::GetContentRegionAvail().y)), true);
+
+    if (!snap) {
+        ImVec2 avail = ImGui::GetContentRegionAvail();
+        const char* title = is_analyzing_.load() ? "Processing I/Q Recording..." : "No H I Analysis Results Yet";
+        ImVec2 ts = ImGui::CalcTextSize(title);
+        ImGui::SetCursorPos(ImVec2((avail.x - ts.x) * 0.5f, avail.y * 0.44f));
+        ui_obs::PushFontSafe(fonts_.semibold);
+        ImGui::TextColored(ui_obs::palette::Cyan, "%s", title);
+        ImGui::PopFont();
+
+        std::string msg = get_status_message();
+        ImVec2 ms = ImGui::CalcTextSize(msg.c_str());
+        ImGui::SetCursorPos(ImVec2(std::max(10.0f, (avail.x - ms.x) * 0.5f), avail.y * 0.44f + 26.0f));
+        ImGui::TextColored(ui_obs::palette::TextMuted, "%s", msg.c_str());
+    } else if (ImGui::BeginTabBar("##AnalyzeTabs")) {
+        if (ImGui::BeginTabItem("1. Calibrated H I Spectrum")) {
+            render_tab_calibrated_spectrum(snap);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("2. Raw Passband & Baseline")) {
+            render_tab_raw_and_baseline(snap);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("3. Time-Frequency Waterfall")) {
+            render_tab_waterfall(ctx, snap);
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("4. Master Dashboard (2x2)")) {
+            render_tab_master_dashboard(ctx, snap);
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+    ImGui::EndChild(); // ##AnalyzeMainCol
+
+    ImGui::EndChild(); // ##AnalyzeRoot
+    ImGui::PopStyleVar(2);
+}
+
+void UiAnalyzePanel::render_top_bar(float width, float height, const std::shared_ptr<const AnalysisSnapshot>& snap) {
+    (void)snap;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui_obs::palette::Surface);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(12.0f, 6.0f));
+    ImGui::BeginChild("##AnalyzeTopBar", ImVec2(width, height), true,
+                      ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+    const bool running = is_analyzing_.load();
+    const bool locked_rec = app_state_.is_file_actively_recording(custom_file_path_);
+
+    // 1. Recording Combo + Browse + Refresh
+    ImGui::BeginDisabled(running);
+    const float right_controls_w = running ? 380.0f : 350.0f;
+    const float combo_w = std::max(180.0f, width - right_controls_w - 190.0f);
+
+    std::string disp_name = custom_file_path_[0]
+        ? fs::path(custom_file_path_).filename().string()
+        : "-- Select .cs16 File --";
+    ImGui::SetNextItemWidth(combo_w);
+    if (ImGui::BeginCombo("##Cs16Selector", disp_name.c_str())) {
+        for (int i = 0; i < static_cast<int>(discovered_files_.size()); ++i) {
+            std::string fn = fs::path(discovered_files_[static_cast<size_t>(i)]).filename().string();
+            bool active_rec = app_state_.is_file_actively_recording(discovered_files_[static_cast<size_t>(i)]);
+            std::string label = active_rec ? (fn + " [RECORDING]") : fn;
+            bool is_sel = (selected_file_idx_ == i);
+            if (ImGui::Selectable(label.c_str(), is_sel)) {
+                selected_file_idx_ = i;
+                on_file_selected(discovered_files_[static_cast<size_t>(i)]);
+            }
+            if (is_sel) ImGui::SetItemDefaultFocus();
+        }
+        ImGui::EndCombo();
+    }
+
+    ImGui::SameLine(0.0f, 6.0f);
+    if (ImGui::Button("Browse...", ImVec2(80.0f, height - 14.0f))) {
+        std::string picked;
+        if (ui_obs::win_fs::browse_for_cs16_file(owner_hwnd_, ui_obs::win_fs::get_default_recordings_dir(), picked)) {
+            select_and_run_file(picked, false);
+        }
+    }
+    ImGui::SameLine(0.0f, 6.0f);
+    if (ImGui::Button("Refresh", ImVec2(72.0f, height - 14.0f))) {
+        scan_files();
+    }
+    ImGui::EndDisabled();
+
+    // 2. Run / Cancel CTA + Live Progress Bar
+    ImGui::SameLine(0.0f, 12.0f);
+    if (!running) {
+        std::string val_err;
+        bool valid = validate_inputs(val_err);
+        ImGui::BeginDisabled(!valid || locked_rec);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.184f, 0.506f, 0.969f, 0.28f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.184f, 0.506f, 0.969f, 0.48f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ui_obs::palette::AccentBlue);
+        ui_obs::PushFontSafe(fonts_.semibold);
+        if (ImGui::Button("Run H I Pipeline", ImVec2(148.0f, height - 14.0f))) {
+            start_analysis();
+        }
+        ImGui::PopFont();
+        ImGui::PopStyleColor(3);
+        ImGui::EndDisabled();
+
+        ImGui::SameLine(0.0f, 12.0f);
+        ImGui::TextColored(valid ? ui_obs::palette::TextMuted : ui_obs::palette::Amber,
+                           "%s", (valid ? get_status_message() : val_err).c_str());
+    } else {
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.937f, 0.267f, 0.267f, 0.28f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.937f, 0.267f, 0.267f, 0.48f));
+        ImGui::PushStyleColor(ImGuiCol_Border, ui_obs::palette::Red);
+        if (ImGui::Button("Cancel", ImVec2(80.0f, height - 14.0f))) {
+            cancel_analysis();
+        }
+        ImGui::PopStyleColor(3);
+
+        ImGui::SameLine(0.0f, 10.0f);
+        float pct = static_cast<float>(progress_pct_.load() / 100.0);
+        char prog_lbl[96];
+        std::snprintf(prog_lbl, sizeof(prog_lbl), "%.1f%%  (%.0f MB/s, ETA %.1fs)",
+                      progress_pct_.load(), progress_speed_.load(), progress_eta_.load());
+        ImGui::ProgressBar(std::clamp(pct, 0.0f, 1.0f), ImVec2(std::max(140.0f, ImGui::GetContentRegionAvail().x), height - 14.0f), prog_lbl);
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleVar();
+    ImGui::PopStyleColor();
+}
+
+void UiAnalyzePanel::render_sidebar_controls(float width, float height, const std::shared_ptr<const AnalysisSnapshot>& snap) {
+    ImGui::BeginChild("##AnalyzeSidebar", ImVec2(width, height), false, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+
+    const bool running = is_analyzing_.load();
+
+    // Card 1: File & Sidecar Metadata
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui_obs::palette::Surface);
+    ImGui::BeginChild("##CardMeta", ImVec2(-1.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
+    ui_obs::PushFontSafe(fonts_.semibold);
+    ImGui::TextColored(ui_obs::palette::Cyan, "RECORDING METADATA");
+    ImGui::PopFont();
+    ImGui::Separator();
+
+    if (current_sidecar_.found_sidecar) {
+        ImGui::TextColored(ui_obs::palette::Emerald, "Sidecar: %s", current_sidecar_.sidecar_source.c_str());
+        if (!current_sidecar_.device_name.empty()) {
+            ImGui::TextColored(ui_obs::palette::TextMuted, "Device: %s", current_sidecar_.device_name.c_str());
+        }
+        if (current_sidecar_.has_gain) {
+            ImGui::TextColored(ui_obs::palette::TextMuted, "Gain: %.1f dB  |  LO Offset: %+.1f kHz",
+                               current_sidecar_.gain_db, current_sidecar_.lo_offset_khz);
+        }
+    } else {
+        ImGui::TextColored(ui_obs::palette::Amber, "No sidecar JSON/TXT found");
+        ImGui::TextColored(ui_obs::palette::TextMuted, "Verify RF parameters below.");
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+    // Card 2: RF & Calibration Parameters
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui_obs::palette::Surface);
+    ImGui::BeginChild("##CardCalib", ImVec2(-1.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
+    ui_obs::PushFontSafe(fonts_.semibold);
+    ImGui::TextColored(ui_obs::palette::Cyan, "RF & CALIBRATION");
+    ImGui::PopFont();
+    ImGui::Separator();
+
+    ImGui::BeginDisabled(running);
+    ImGui::TextColored(ui_obs::palette::TextMuted, "Center Frequency (MHz)");
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputDouble("##AnaFreq", &ui_center_freq_mhz_, 0.05, 0.5, "%.4f MHz");
+
+    ImGui::TextColored(ui_obs::palette::TextMuted, "Sample Rate (MSPS)");
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::InputDouble("##AnaRate", &ui_sample_rate_msps_, 0.1, 0.5, "%.3f MSPS");
+
+    ImGui::TextColored(ui_obs::palette::TextMuted, "System Noise Temp T_sys (K)");
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputFloat("##AnaTsys", &ui_tsys_k_, 5.0f, 25.0f, "%.1f K")) {
+        if (ui_tsys_k_ < 1.0f) ui_tsys_k_ = 1.0f;
+    }
+
+    ImGui::TextColored(ui_obs::palette::TextMuted, "Max Time Window (s, 0 = Full)");
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::InputFloat("##AnaDur", &ui_duration_s_, 5.0f, 30.0f, "%.1f s")) {
+        if (ui_duration_s_ < 0.0f) ui_duration_s_ = 0.0f;
+    }
+    ImGui::EndDisabled();
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+    // Card 3: Scientific Pipeline Configuration
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui_obs::palette::Surface);
+    ImGui::BeginChild("##CardPipe", ImVec2(-1.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
+    ui_obs::PushFontSafe(fonts_.semibold);
+    ImGui::TextColored(ui_obs::palette::Cyan, "DSP & BASELINE MODEL");
+    ImGui::PopFont();
+    ImGui::Separator();
+
+    ImGui::BeginDisabled(running);
+    static const char* fft_labels[] = {"2048", "4096", "8192", "16384", "32768"};
+    ImGui::TextColored(ui_obs::palette::TextMuted, "Spectral Resolution (FFT)");
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::Combo("##AnaFft", &ui_fft_size_idx_, fft_labels, 5);
+
+    ImGui::TextColored(ui_obs::palette::TextMuted, "DC Spike Excision (kHz)");
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::SliderFloat("##AnaDc", &ui_dc_clear_khz_, 0.0f, 30.0f, "%.1f kHz")) {
+        if (ui_dc_clear_khz_ < 0.0f) ui_dc_clear_khz_ = 0.0f;
+    }
+
+    static const char* base_labels[] = {"Ripple Filter (Gaussian)", "Asymmetric Least Squares", "Sigma-Clipped Polynomial"};
+    ImGui::TextColored(ui_obs::palette::TextMuted, "Baseline Removal Method");
+    ImGui::SetNextItemWidth(-1.0f);
+    ImGui::Combo("##AnaBase", &ui_baseline_idx_, base_labels, 3);
+
+    if (ui_baseline_idx_ == 1) {
+        ImGui::TextColored(ui_obs::palette::TextMuted, "ALS Smoothness (Lambda)");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat("##AlsLam", &ui_als_lambda_, 100.0f, 50000.0f, "%.0f");
+        ImGui::TextColored(ui_obs::palette::TextMuted, "ALS Asymmetry (p)");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderFloat("##AlsP", &ui_als_p_, 0.001f, 0.1f, "%.3f");
+    } else if (ui_baseline_idx_ == 2) {
+        ImGui::TextColored(ui_obs::palette::TextMuted, "Polynomial Degree");
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::SliderInt("##PolyDeg", &ui_poly_deg_, 3, 18);
+    }
+    ImGui::EndDisabled();
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+    // Card 4: Waterfall Colormap & Artifact Export
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ui_obs::palette::Surface);
+    ImGui::BeginChild("##CardExport", ImVec2(-1.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
+    ui_obs::PushFontSafe(fonts_.semibold);
+    ImGui::TextColored(ui_obs::palette::Cyan, "COLORMAP & EXPORT");
+    ImGui::PopFont();
+    ImGui::Separator();
+
+    static const char* cmaps[] = {"Viridis", "Inferno", "Plasma", "Turbo"};
+    ImGui::TextColored(ui_obs::palette::TextMuted, "Waterfall Colormap");
+    ImGui::SetNextItemWidth(-1.0f);
+    if (ImGui::Combo("##AnaCmap", &ui_colormap_idx_, cmaps, 4)) {
+        active_lut256_ = ui_obs::build_colormap_lut256(ui_colormap_idx_);
+    }
+
+    const bool can_export = (snap != nullptr && !running && !is_exporting_.load());
+    ImGui::BeginDisabled(!can_export);
+    if (ImGui::Button("Export All 8 Artifacts", ImVec2(-1.0f, 32.0f))) {
+        start_export(snap);
+    }
+    ImGui::EndDisabled();
+
+    if (ImGui::Button("Open Output Directory", ImVec2(-1.0f, 28.0f))) {
+        std::string out_dir = snap ? get_output_dir_for_source(snap->source_filepath) : get_exe_parent_output_dir();
+        ui_obs::win_fs::open_folder_in_explorer(out_dir);
+    }
+
+    std::string exp_msg = get_export_message();
+    if (!exp_msg.empty()) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ui_obs::palette::Emerald);
+        ImGui::TextWrapped("%s", exp_msg.c_str());
+        ImGui::PopStyleColor();
+    }
+
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+    ImGui::EndChild(); // ##AnalyzeSidebar
+}
+
+void UiAnalyzePanel::render_kpi_strip(float width, const AstrophysicalMetrics& m, const AstroConfig& cfg) {
+    (void)width;
+    if (!ImGui::BeginTable("##AnaKpiStrip", 6, ImGuiTableFlags_SizingStretchSame)) {
+        return;
+    }
+
+    auto kpi_card = [&](int col, const char* title, const char* val_str, ImVec4 accent) {
+        ImGui::TableSetColumnIndex(col);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, ui_obs::palette::Surface);
+        ImGui::BeginChild(title, ImVec2(-1.0f, 54.0f), true,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        ImGui::TextColored(ui_obs::palette::TextMuted, "%s", title);
+        ui_obs::PushFontSafe(fonts_.mono);
+        ImGui::TextColored(accent, "%s", val_str);
+        ImGui::PopFont();
+        ImGui::EndChild();
+        ImGui::PopStyleColor();
+    };
+
+    ImGui::TableNextRow();
+    char buf[64];
+
+    std::snprintf(buf, sizeof(buf), "%.4f MHz", m.peak_freq_mhz);
+    kpi_card(0, "Peak Frequency", buf, ui_obs::palette::Cyan);
+
+    std::snprintf(buf, sizeof(buf), "%+.2f km/s", m.peak_vel_kms);
+    kpi_card(1, "Doppler V_LSR", buf, ui_obs::palette::TextPrimary);
+
+    std::snprintf(buf, sizeof(buf), "%.2f K", m.peak_temp_k);
+    kpi_card(2, "Brightness T_A", buf, ui_obs::palette::Emerald);
+
+    ImVec4 snr_col = (m.snr >= 3.0) ? ui_obs::palette::Emerald
+                   : (m.snr >= 2.0) ? ui_obs::palette::Amber
+                                    : ui_obs::palette::Red;
+    std::snprintf(buf, sizeof(buf), "%.2f sigma", m.snr);
+    kpi_card(3, "Detection SNR", buf, snr_col);
+
+    std::snprintf(buf, sizeof(buf), "%.2f km/s", m.fwhm_kms);
+    kpi_card(4, "Line FWHM", buf, ui_obs::palette::Pink);
+
+    std::snprintf(buf, sizeof(buf), "%.2e /cm2", m.column_density_cm2);
+    kpi_card(5, "N_HI Column", buf, cfg.system_temp_k > 0.0 ? ui_obs::palette::TextPrimary : ui_obs::palette::TextMuted);
+
+    ImGui::EndTable();
+}
+
+void UiAnalyzePanel::render_tab_calibrated_spectrum(const std::shared_ptr<const AnalysisSnapshot>& snap) {
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (avail.x < 100.0f || avail.y < 100.0f || snap->vel_kms.size() < 2) return;
+
+    // Plot calibrated T_A (K) vs Doppler Radial Velocity (km/s), zoomed cleanly [-220, +220] km/s if span permits
+    const double v_first = snap->vel_kms.front();
+    const double v_last  = snap->vel_kms.back();
+    const double v_lo_full = std::min(v_first, v_last);
+    const double v_hi_full = std::max(v_first, v_last);
+    const double x_min = (v_hi_full - v_lo_full > 440.0) ? std::max(v_lo_full, -220.0) : v_lo_full;
+    const double x_max = (v_hi_full - v_lo_full > 440.0) ? std::min(v_hi_full,  220.0) : v_hi_full;
+
+    double ymin = 1e9, ymax = -1e9;
+    for (size_t i = 0; i < snap->calibrated_k.size(); ++i) {
+        double v = snap->vel_kms[i];
+        if (v < x_min || v > x_max) continue;
+        ymin = std::min(ymin, snap->calibrated_k[i]);
+        ymax = std::max(ymax, snap->calibrated_k[i]);
+    }
+    if (ymin >= ymax) { ymin = -5.0; ymax = 15.0; }
+    double pad = std::max(1.0, (ymax - ymin) * 0.14);
+    ymin -= pad;
+    ymax += pad;
+
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    ui_obs::PlotMargin m;
+    m.left = 64.0f; m.right = 20.0f; m.top = 34.0f; m.bottom = 34.0f;
+    auto vp = ui_obs::PlotViewport2D::create(origin, avail, x_min, x_max, ymin, ymax, m);
+    vp.draw_background_and_grid(dl, 7, 5, "%.0f", "%.1f", "Doppler Radial Velocity V_LSR (km/s)", "Antenna Temp T_A (K)", fonts_.mono);
+
+    // Top axis: corresponding Sky Frequency (MHz): f = f0 * (1 - v / c)
+    const double f_top_left  = HYDROGEN_REST_FREQ_MHZ * (1.0 - x_min / SPEED_OF_LIGHT_KMS);
+    const double f_top_right = HYDROGEN_REST_FREQ_MHZ * (1.0 - x_max / SPEED_OF_LIGHT_KMS);
+    vp.draw_top_axis(dl, f_top_left, f_top_right, 7, "%.3f", "Sky Freq (MHz)", fonts_.mono);
+
+    // Zero temperature baseline & H I Rest Velocity (0 km/s)
+    if (ymin < 0.0 && ymax > 0.0) {
+        float zy = vp.map_y(0.0);
+        dl->AddLine(ImVec2(vp.plot_min.x, zy), ImVec2(vp.plot_max.x, zy), ui_obs::palette::U32(ui_obs::palette::TextDim, 0.8f), 1.0f);
+    }
+    if (0.0 >= x_min && 0.0 <= x_max) {
+        float zx = vp.map_x(0.0);
+        dl->AddLine(ImVec2(zx, vp.plot_min.y), ImVec2(zx, vp.plot_max.y), ui_obs::palette::U32(ui_obs::palette::Amber, 0.7f), 1.3f);
+    }
+
+    vp.draw_decimated_xy(dl, snap->vel_kms.size(),
+                         [&](size_t i) { return snap->vel_kms[i]; },
+                         [&](size_t i) { return snap->calibrated_k[i]; },
+                         ui_obs::palette::U32(ui_obs::palette::Cyan), 1.6f, trace_scratch_);
+
+    if (snap->metrics.gauss_fit.success &&
+        snap->metrics.gauss_fit.fitted_curve.size() == snap->vel_kms.size()) {
+        vp.draw_decimated_xy(dl, snap->vel_kms.size(),
+                             [&](size_t i) { return snap->vel_kms[i]; },
+                             [&](size_t i) { return snap->metrics.gauss_fit.fitted_curve[i]; },
+                             ui_obs::palette::U32(ui_obs::palette::Pink), 2.2f, trace_scratch_);
+    }
+
+    // Legend top-right
+    ImVec2 leg(vp.plot_max.x - 190.0f, vp.plot_min.y + 8.0f);
+    dl->AddRectFilled(leg, ImVec2(vp.plot_max.x - 8.0f, vp.plot_min.y + 52.0f), ui_obs::palette::U32(ui_obs::palette::Surface, 0.88f), 4.0f);
+    dl->AddRect(leg, ImVec2(vp.plot_max.x - 8.0f, vp.plot_min.y + 52.0f), ui_obs::palette::PlotBorder32, 4.0f);
+    dl->AddLine(ImVec2(leg.x + 8.0f, leg.y + 13.0f), ImVec2(leg.x + 26.0f, leg.y + 13.0f), ui_obs::palette::U32(ui_obs::palette::Cyan), 2.0f);
+    dl->AddText(ImVec2(leg.x + 32.0f, leg.y + 6.0f), ui_obs::palette::U32(ui_obs::palette::TextPrimary), "Calibrated H I");
+    dl->AddLine(ImVec2(leg.x + 8.0f, leg.y + 31.0f), ImVec2(leg.x + 26.0f, leg.y + 31.0f), ui_obs::palette::U32(ui_obs::palette::Pink), 2.0f);
+    dl->AddText(ImVec2(leg.x + 32.0f, leg.y + 24.0f), ui_obs::palette::U32(ui_obs::palette::TextPrimary), "Gaussian Profile");
+
+    ImGui::InvisibleButton("##CalSpecHit", avail);
+    if (ImGui::IsItemHovered() && vp.contains(ImGui::GetIO().MousePos)) {
+        ImVec2 mp = ImGui::GetIO().MousePos;
+        dl->AddLine(ImVec2(mp.x, vp.plot_min.y), ImVec2(mp.x, vp.plot_max.y), ui_obs::palette::PlotCrosshair);
+        dl->AddLine(ImVec2(vp.plot_min.x, mp.y), ImVec2(vp.plot_max.x, mp.y), ui_obs::palette::PlotCrosshair);
+        double vh = vp.unmap_x(mp.x);
+        double th = vp.unmap_y(mp.y);
+        double fh = HYDROGEN_REST_FREQ_MHZ * (1.0 - vh / SPEED_OF_LIGHT_KMS);
+        ImGui::SetTooltip("V_LSR: %+.2f km/s  |  Freq: %.4f MHz  |  T_A: %.2f K", vh, fh, th);
+    }
+}
+
+void UiAnalyzePanel::render_tab_raw_and_baseline(const std::shared_ptr<const AnalysisSnapshot>& snap) {
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (avail.x < 100.0f || avail.y < 100.0f || snap->stream.freq_mhz.size() < 2) return;
+
+    const double f_min = snap->stream.freq_mhz.front();
+    const double f_max = snap->stream.freq_mhz.back();
+
+    auto [min_it, max_it] = std::minmax_element(snap->raw_db.begin(), snap->raw_db.end());
+    double ymin = *min_it - 1.5;
+    double ymax = *max_it + 1.5;
+    if (ymin >= ymax) { ymin = -80.0; ymax = 0.0; }
+
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    ui_obs::PlotMargin m;
+    m.left = 64.0f; m.right = 20.0f; m.top = 14.0f; m.bottom = 32.0f;
+    auto vp = ui_obs::PlotViewport2D::create(origin, avail, f_min, f_max, ymin, ymax, m);
+    vp.draw_background_and_grid(dl, 6, 5, "%.2f", "%.1f", "Frequency (MHz)", "Rel Power (dB)", fonts_.mono);
+
+    // Highlight protected HI band window
+    double hi_mhz = HYDROGEN_REST_FREQ_MHZ;
+    double hi_hw  = snap->config_used.hi_protection_half_width_khz * 1e-3;
+    if (hi_mhz + hi_hw >= f_min && hi_mhz - hi_hw <= f_max) {
+        float x0 = std::clamp(vp.map_x(hi_mhz - hi_hw), vp.plot_min.x, vp.plot_max.x);
+        float x1 = std::clamp(vp.map_x(hi_mhz + hi_hw), vp.plot_min.x, vp.plot_max.x);
+        dl->AddRectFilled(ImVec2(x0, vp.plot_min.y), ImVec2(x1, vp.plot_max.y), ui_obs::palette::U32(ui_obs::palette::Amber, 0.08f));
+        float hx = vp.map_x(hi_mhz);
+        dl->AddLine(ImVec2(hx, vp.plot_min.y), ImVec2(hx, vp.plot_max.y), ui_obs::palette::U32(ui_obs::palette::Amber, 0.7f));
+    }
+
+    vp.draw_decimated_trace(dl, snap->raw_db.size(), f_min, f_max,
+                            [&](size_t i) { return snap->raw_db[i]; },
+                            ui_obs::palette::U32(ui_obs::palette::Cyan), 1.5f, trace_scratch_);
+
+    if (snap->baseline_db.size() == snap->raw_db.size()) {
+        vp.draw_decimated_trace(dl, snap->baseline_db.size(), f_min, f_max,
+                                [&](size_t i) { return snap->baseline_db[i]; },
+                                ui_obs::palette::U32(ui_obs::palette::Orange), 2.1f, trace_scratch_);
+    }
+
+    ImGui::InvisibleButton("##RawBaseHit", avail);
+    if (ImGui::IsItemHovered() && vp.contains(ImGui::GetIO().MousePos)) {
+        ImVec2 mp = ImGui::GetIO().MousePos;
+        dl->AddLine(ImVec2(mp.x, vp.plot_min.y), ImVec2(mp.x, vp.plot_max.y), ui_obs::palette::PlotCrosshair);
+        dl->AddLine(ImVec2(vp.plot_min.x, mp.y), ImVec2(vp.plot_max.x, mp.y), ui_obs::palette::PlotCrosshair);
+        ImGui::SetTooltip("%.4f MHz  |  %.2f dB", vp.unmap_x(mp.x), vp.unmap_y(mp.y));
+    }
+}
+
+void UiAnalyzePanel::render_waterfall_view(ID3D11DeviceContext* ctx, ImVec2 avail,
+                                           const std::shared_ptr<const AnalysisSnapshot>& snap,
+                                           const char* img_id) {
+    (void)img_id;
+    update_waterfall_texture(ctx, snap);
+    if (!waterfall_srv_ || avail.x < 120.0f || avail.y < 60.0f) {
+        ImGui::TextColored(ui_obs::palette::TextMuted, "No waterfall integration data available.");
+        return;
+    }
+
+    const float axis_left = 54.0f;
+    const float colorbar_right = 76.0f;
+    const float bottom_axis = 26.0f;
+
+    float img_w = std::max(40.0f, avail.x - axis_left - colorbar_right);
+    float img_h = std::max(40.0f, avail.y - bottom_axis);
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImVec2 img_min(origin.x + axis_left, origin.y + 4.0f);
+    ImVec2 img_max(img_min.x + img_w, img_min.y + img_h - 4.0f);
+
+    ImGui::SetCursorScreenPos(img_min);
+    ImGui::Image(reinterpret_cast<ImTextureID>(waterfall_srv_), ImVec2(img_w, img_max.y - img_min.y));
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddRect(img_min, img_max, ui_obs::palette::PlotBorder32);
+
+    // Axis ticks around image
+    ui_obs::PushFontSafe(fonts_.mono);
+    double f0 = snap->stream.freq_mhz.empty() ? 0.0 : snap->stream.freq_mhz.front();
+    double f1 = snap->stream.freq_mhz.empty() ? 1.0 : snap->stream.freq_mhz.back();
+    char buf[32];
+    for (int i = 0; i <= 4; ++i) {
+        double frac = static_cast<double>(i) / 4.0;
+        float px = img_min.x + static_cast<float>(frac) * img_w;
+        std::snprintf(buf, sizeof(buf), "%.2f", f0 + frac * (f1 - f0));
+        ImVec2 ts = ImGui::CalcTextSize(buf);
+        dl->AddText(ImVec2(std::clamp(px - ts.x * 0.5f, img_min.x, img_max.x - ts.x), img_max.y + 4.0f),
+                    ui_obs::palette::U32(ui_obs::palette::TextMuted), buf);
+    }
+    for (int i = 0; i <= 3; ++i) {
+        double frac = static_cast<double>(i) / 3.0;
+        float py = img_min.y + static_cast<float>(frac) * (img_max.y - img_min.y);
+        std::snprintf(buf, sizeof(buf), "%.0fs", frac * snap->wf_duration_s);
+        ImVec2 ts = ImGui::CalcTextSize(buf);
+        dl->AddText(ImVec2(img_min.x - ts.x - 6.0f, py - ts.y * 0.5f),
+                    ui_obs::palette::U32(ui_obs::palette::TextMuted), buf);
+    }
+    ImGui::PopFont();
+
+    ui_obs::draw_vertical_colorbar(
+        dl,
+        ImVec2(img_max.x + 10.0f, img_min.y),
+        ImVec2(img_max.x + 24.0f, img_max.y),
+        snap->wf_vmin_db, snap->wf_vmax_db, "%.1f", active_lut256_, fonts_.mono
+    );
+
+    if (ImGui::IsItemHovered()) {
+        ImVec2 mp = ImGui::GetIO().MousePos;
+        double u = std::clamp((mp.x - img_min.x) / img_w, 0.0f, 1.0f);
+        double v = std::clamp((mp.y - img_min.y) / (img_max.y - img_min.y), 0.0f, 1.0f);
+        double freq = f0 + u * (f1 - f0);
+        double t_s = v * snap->wf_duration_s;
+        ImGui::SetTooltip("%.4f MHz  |  t = %.1f s  |  Contrast [%.1f, %.1f] dB",
+                          freq, t_s, snap->wf_vmin_db, snap->wf_vmax_db);
+    }
+}
+
+void UiAnalyzePanel::render_tab_waterfall(ID3D11DeviceContext* ctx, const std::shared_ptr<const AnalysisSnapshot>& snap) {
+    render_waterfall_view(ctx, ImGui::GetContentRegionAvail(), snap, "##TabWfImg");
+}
+
+void UiAnalyzePanel::render_tab_master_dashboard(ID3D11DeviceContext* ctx, const std::shared_ptr<const AnalysisSnapshot>& snap) {
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    if (avail.x < 160.0f || avail.y < 140.0f) return;
+
+    const float cell_w = (avail.x - 10.0f) * 0.5f;
+    const float cell_h = (avail.y - 10.0f) * 0.5f;
+
+    // Row 1: Q1 Raw & Baseline | Q2 Calibrated H I Freq Spectrum (dB)
+    ImGui::BeginChild("##Q1", ImVec2(cell_w, cell_h), true);
+    ImGui::TextColored(ui_obs::palette::TextMuted, "Q1: Raw Passband & Baseline (dB)");
+    render_tab_raw_and_baseline(snap);
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+
+    ImGui::BeginChild("##Q2", ImVec2(cell_w, cell_h), true);
+    ImGui::TextColored(ui_obs::palette::TextMuted, "Q2: Calibrated H I Frequency Spectrum (dB vs MHz)");
+    {
+        ImVec2 q2_av = ImGui::GetContentRegionAvail();
+        if (q2_av.x > 60.0f && q2_av.y > 40.0f && snap->stream.freq_mhz.size() >= 2 &&
+            snap->calibrated_db.size() == snap->stream.freq_mhz.size()) {
+            double f0 = snap->stream.freq_mhz.front();
+            double f1 = snap->stream.freq_mhz.back();
+            auto [mn, mx] = std::minmax_element(snap->calibrated_db.begin(), snap->calibrated_db.end());
+            double ymin = std::min(-0.2, *mn - 0.15);
+            double ymax = std::max(0.4,  *mx + 0.15);
+
+            ui_obs::PlotMargin m;
+            m.left = 54.0f; m.right = 14.0f; m.top = 10.0f; m.bottom = 28.0f;
+            auto vp = ui_obs::PlotViewport2D::create(ImGui::GetCursorScreenPos(), q2_av, f0, f1, ymin, ymax, m);
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            vp.draw_background_and_grid(dl, 5, 4, "%.2f", "%.2f", "Frequency (MHz)", "dB", fonts_.mono);
+            if (ymin < 0.0 && ymax > 0.0) {
+                float zy = vp.map_y(0.0);
+                dl->AddLine(ImVec2(vp.plot_min.x, zy), ImVec2(vp.plot_max.x, zy), ui_obs::palette::U32(ui_obs::palette::TextDim));
+            }
+            if (HYDROGEN_REST_FREQ_MHZ >= f0 && HYDROGEN_REST_FREQ_MHZ <= f1) {
+                float hx = vp.map_x(HYDROGEN_REST_FREQ_MHZ);
+                dl->AddLine(ImVec2(hx, vp.plot_min.y), ImVec2(hx, vp.plot_max.y), ui_obs::palette::U32(ui_obs::palette::Amber, 0.7f));
+            }
+            vp.draw_decimated_trace(dl, snap->calibrated_db.size(), f0, f1,
+                                    [&](size_t i) { return snap->calibrated_db[i]; },
+                                    ui_obs::palette::U32(ui_obs::palette::Cyan), 1.5f, trace_scratch_);
+            ImGui::InvisibleButton("##Q2Hit", q2_av);
+        }
+    }
+    ImGui::EndChild();
+
+    // Row 2: Q3 Doppler Velocity Profile (T_A K + Fit) | Q4 Integrated Waterfall
+    ImGui::BeginChild("##Q3", ImVec2(cell_w, cell_h), true);
+    ImGui::TextColored(ui_obs::palette::TextMuted, "Q3: Doppler Velocity T_A (K) & Gaussian Fit");
+    render_tab_calibrated_spectrum(snap);
+    ImGui::EndChild();
+
+    ImGui::SameLine();
+
+    ImGui::BeginChild("##Q4", ImVec2(cell_w, cell_h), true);
+    ImGui::TextColored(ui_obs::palette::TextMuted, "Q4: Integrated Waterfall History");
+    render_waterfall_view(ctx, ImGui::GetContentRegionAvail(), snap, "##Q4WfImg");
+    ImGui::EndChild();
+}
+
+void UiAnalyzePanel::update_waterfall_texture(ID3D11DeviceContext* ctx, const std::shared_ptr<const AnalysisSnapshot>& snap) {
+    if (!d3d_device_ || !ctx || !snap || snap->wf_tex_w <= 0 || snap->wf_tex_h <= 0 || snap->wf_norm_u8.empty()) {
+        return;
+    }
+
+    const int w = snap->wf_tex_w;
+    const int h = snap->wf_tex_h;
+
+    // Fast early-out if GPU texture already matches snapshot and colormap!
+    if (waterfall_texture_ && last_uploaded_snap_ == snap.get() && last_colormap_idx_ == ui_colormap_idx_ &&
+        tex_width_ == w && tex_height_ == h) {
+        return;
+    }
+
+    if (!waterfall_texture_ || tex_width_ != w || tex_height_ != h) {
+        release_d3d_resources();
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = static_cast<UINT>(w);
+        desc.Height = static_cast<UINT>(h);
         desc.MipLevels = 1;
         desc.ArraySize = 1;
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -130,695 +1116,43 @@ void UiAnalyzePanel::update_waterfall_texture(ID3D11DeviceContext* ctx) {
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
-        HRESULT hr = d3d_device_->CreateTexture2D(&desc, nullptr, &waterfall_texture_);
-        if (FAILED(hr) || !waterfall_texture_) return;
-
-        hr = d3d_device_->CreateShaderResourceView(waterfall_texture_, nullptr, &waterfall_srv_);
-        if (FAILED(hr)) {
-            release_d3d_resources();
-            return;
-        }
-
-        tex_width_ = cols;
-        tex_height_ = rows;
-    }
-
-    D3D11_MAPPED_SUBRESOURCE mapped;
-    HRESULT hr = ctx->Map(waterfall_texture_, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
-    if (FAILED(hr)) return;
-
-    ColormapType cmap = static_cast<ColormapType>(ui_colormap_idx_);
-
-    float min_val = 1e9f, max_val = -1e9f;
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            double base = std::max(1e-12, baseline_power_[c]);
-            float wf = stream_res_.waterfall_data[r * cols + c];
-            float rel_db = 10.0f * std::log10(std::max(1e-6f, wf / static_cast<float>(base)));
-            min_val = std::min(min_val, rel_db);
-            max_val = std::max(max_val, rel_db);
-        }
-    }
-    float range = std::max(0.1f, max_val - min_val);
-
-    uint8_t* dst = static_cast<uint8_t*>(mapped.pData);
-    for (int r = 0; r < rows; ++r) {
-        int src_r = rows - 1 - r;
-        uint32_t* row_pixels = reinterpret_cast<uint32_t*>(dst + r * mapped.RowPitch);
-
-        for (int c = 0; c < cols; ++c) {
-            double base = std::max(1e-12, baseline_power_[c]);
-            float wf = stream_res_.waterfall_data[src_r * cols + c];
-            float rel_db = 10.0f * std::log10(std::max(1e-6f, wf / static_cast<float>(base)));
-            float norm = std::clamp((rel_db - min_val) / range, 0.0f, 1.0f);
-            PixelColor col = sample_colormap(cmap, norm);
-            row_pixels[c] = (255 << 24) | (col.b << 16) | (col.g << 8) | col.r;
+        if (SUCCEEDED(d3d_device_->CreateTexture2D(&desc, nullptr, &waterfall_texture_))) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc{};
+            srv_desc.Format = desc.Format;
+            srv_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            srv_desc.Texture2D.MipLevels = 1;
+            d3d_device_->CreateShaderResourceView(waterfall_texture_, &srv_desc, &waterfall_srv_);
+            tex_width_ = w;
+            tex_height_ = h;
         }
     }
 
-    ctx->Unmap(waterfall_texture_, 0);
+    if (waterfall_texture_) {
+        const size_t total = static_cast<size_t>(w) * static_cast<size_t>(h);
+        if (rgba_upload_scratch_.size() != total) {
+            rgba_upload_scratch_.resize(total);
+        }
+        const uint32_t* lut = active_lut256_.data();
+        const uint8_t* src = snap->wf_norm_u8.data();
+        for (size_t i = 0; i < total; ++i) {
+            rgba_upload_scratch_[i] = lut[src[i]];
+        }
 
-    waterfall_texture_dirty_ = false;
-    last_colormap_idx_ = ui_colormap_idx_;
-}
-
-void UiAnalyzePanel::start_analysis() {
-    std::string path;
-    if (selected_file_idx_ >= 0 && selected_file_idx_ < static_cast<int>(discovered_files_.size())) {
-        path = discovered_files_[selected_file_idx_];
-    } else if (custom_file_path_[0] != '\0') {
-        path = custom_file_path_;
-    }
-
-    if (path.empty() || !std::filesystem::exists(path)) {
-        status_message_ = "Error: Invalid or non-existent file.";
-        return;
-    }
-
-    if (app_state_.is_file_actively_recording(path)) {
-        status_message_ = "Blocked: File is actively being recorded! Stop recording first.";
-        return;
-    }
-
-    if (is_analyzing_) return;
-
-    if (worker_thread_ && worker_thread_->joinable()) {
-        worker_thread_->join();
-    }
-
-    config_.center_freq_hz = ui_center_freq_mhz_ * 1e6;
-    config_.sample_rate_hz = ui_sample_rate_msps_ * 1e6;
-    config_.fft_size = FFT_SIZES[ui_fft_size_idx_];
-    config_.baseline_method = static_cast<BaselineMethod>(ui_baseline_idx_);
-    config_.system_temp_k = ui_tsys_k_;
-    config_.max_duration_s = ui_duration_s_;
-    config_.dc_clear_hz = ui_dc_clear_khz_ * 1e3;
-
-    cancel_requested_ = false;
-    is_analyzing_ = true;
-    progress_pct_ = 0.0;
-    progress_speed_ = 0.0;
-    progress_eta_ = 0.0;
-    status_message_ = "Running scientific analysis...";
-    has_results_ = false;
-
-    worker_thread_ = std::make_unique<std::thread>([this, path]() {
-        try {
-            StreamingProcessor processor(path, config_);
-            processor.set_cancel_token(&cancel_requested_);
-            auto prog_cb = [this](double pct, double speed, double eta) {
-                progress_pct_ = pct;
-                progress_speed_ = speed;
-                progress_eta_ = eta;
-            };
-
-            StreamingResults stream = processor.process(prog_cb);
-
-            if (cancel_requested_.load()) {
-                status_message_ = "Analysis cancelled by user.";
-                is_analyzing_ = false;
-                return;
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        if (SUCCEEDED(ctx->Map(waterfall_texture_, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
+            uint8_t* dst = static_cast<uint8_t*>(mapped.pData);
+            const size_t row_bytes = static_cast<size_t>(w) * sizeof(uint32_t);
+            for (int y = 0; y < h; ++y) {
+                std::memcpy(dst + static_cast<size_t>(y) * mapped.RowPitch,
+                            rgba_upload_scratch_.data() + static_cast<size_t>(y) * static_cast<size_t>(w),
+                            row_bytes);
             }
-
-            DCExcisionInfo dc_inf;
-            std::vector<double> dc_cln = DCExcision::excise(stream.averaged_power, config_, dc_inf);
-
-            int n_rfi = 0;
-            std::vector<double> rfi_cln = RFIFilter::mitigate(dc_cln, stream.freq_mhz, config_, n_rfi);
-
-            BaselineResults bl = BaselineFitter::fit(rfi_cln, stream.freq_mhz, config_);
-
-            size_t nfft = stream.freq_mhz.size();
-            std::vector<double> cal_k(nfft);
-            std::vector<double> cal_db(nfft);
-            std::vector<double> v_kms = Astrophysics::compute_doppler_velocity(stream.freq_hz);
-
-            for (size_t i = 0; i < nfft; ++i) {
-                double base_safe = std::max(1e-12, bl.baseline_power[i]);
-                cal_k[i] = config_.system_temp_k * (rfi_cln[i] - bl.baseline_power[i]) / base_safe;
-                cal_db[i] = 10.0 * std::log10(std::max(1e-6, rfi_cln[i] / base_safe));
-            }
-
-            double slope = 0.0, intercept = 0.0;
-            BaselineFitter::refine_local(v_kms, cal_k, cal_db, config_, slope, intercept);
-
-            AstrophysicalMetrics m = Astrophysics::calculate_metrics(
-                stream.freq_mhz, v_kms, cal_k, cal_db, config_
-            );
-
-            {
-                std::lock_guard<std::mutex> lock(data_mutex_);
-                stream_res_ = std::move(stream);
-                rfi_clean_power_ = std::move(rfi_cln);
-                baseline_power_ = std::move(bl.baseline_power);
-                baseline_db_ = std::move(bl.baseline_db);
-                calibrated_k_ = std::move(cal_k);
-                calibrated_db_ = std::move(cal_db);
-                vel_kms_ = std::move(v_kms);
-                metrics_ = m;
-                num_rfi_excised_ = n_rfi;
-                dc_info_ = dc_inf;
-                has_results_ = true;
-                waterfall_texture_dirty_ = true;
-                status_message_ = "Analysis complete! Galactic HI Line Detected (SNR: " +
-                                  std::to_string(static_cast<int>(m.snr * 10) / 10.0f).substr(0, 4) + " sigma)";
-            }
-        } catch (const std::exception& ex) {
-            status_message_ = std::string("Error: ") + ex.what();
-        }
-        is_analyzing_ = false;
-    });
-}
-
-void UiAnalyzePanel::render_top_bar() {
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.09f, 0.11f, 1.0f));
-    ImGui::BeginChild("AnalyzeTopBar", ImVec2(0, 46), true);
-
-    ImGui::SetCursorPosY(8);
-    ImGui::TextColored(ImVec4(0.40f, 0.90f, 1.0f, 1.0f), "ASTRO 21cm HYDROGEN LINE ANALYZER");
-    ImGui::SameLine();
-    ImGui::TextDisabled("| SatDump-Style High-Precision Astrophysics Pipeline");
-
-    ImGui::SameLine(ImGui::GetWindowWidth() - 340);
-    if (is_analyzing_) {
-        float pct = static_cast<float>(progress_pct_.load() / 100.0);
-        char bar_text[64];
-        snprintf(bar_text, sizeof(bar_text), "%.1f%% (%.1f MB/s)", pct * 100.0f, progress_speed_.load());
-        ImGui::ProgressBar(pct, ImVec2(320, 24), bar_text);
-    } else {
-        ImGui::TextColored(ImVec4(0.2f, 0.8f, 0.4f, 1.0f), "%s", status_message_.c_str());
-    }
-
-    ImGui::EndChild();
-    ImGui::PopStyleColor();
-}
-
-void UiAnalyzePanel::render_sidebar_controls() {
-    ImGui::BeginChild("AnalyzeSidebar", ImVec2(360, 0), true);
-
-    std::string cur_sel_file;
-    if (selected_file_idx_ >= 0 && selected_file_idx_ < static_cast<int>(discovered_files_.size())) {
-        cur_sel_file = discovered_files_[selected_file_idx_];
-    } else if (custom_file_path_[0] != '\0') {
-        cur_sel_file = custom_file_path_;
-    }
-    bool is_active_recording = app_state_.is_file_actively_recording(cur_sel_file);
-
-    ImGui::TextColored(ImVec4(0.40f, 0.90f, 1.0f, 1.0f), "OBSERVATION CAPTURE");
-    ImGui::Separator();
-
-    ImGui::BeginDisabled(is_analyzing_);
-
-    if (ImGui::Button("Scan Recordings", ImVec2(160, 26))) {
-        scan_files();
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Refresh", ImVec2(90, 26))) {
-        scan_files();
-    }
-
-    if (!discovered_files_.empty()) {
-        std::string preview = std::filesystem::path(discovered_files_[selected_file_idx_]).filename().string();
-        if (ImGui::BeginCombo("Select File", preview.c_str())) {
-            for (int i = 0; i < static_cast<int>(discovered_files_.size()); ++i) {
-                bool is_selected = (selected_file_idx_ == i);
-                std::string fname = std::filesystem::path(discovered_files_[i]).filename().string();
-                if (ImGui::Selectable(fname.c_str(), is_selected)) {
-                    selected_file_idx_ = i;
-                    on_file_selected(discovered_files_[i]);
-                }
-                if (is_selected) ImGui::SetItemDefaultFocus();
-            }
-            ImGui::EndCombo();
-        }
-    }
-
-    ImGui::InputText("Custom Path", custom_file_path_, sizeof(custom_file_path_));
-
-    // Sidecar metadata HUD box
-    if (current_sidecar_.found_sidecar) {
-        ImGui::Spacing();
-        ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.12f, 0.16f, 0.20f, 0.8f));
-        ImGui::BeginChild("SidecarBox", ImVec2(0, 105), true);
-        ImGui::TextColored(ImVec4(0.11f, 0.82f, 0.63f, 1.0f), "Accompanied Sidecar: %s", current_sidecar_.sidecar_source.c_str());
-        ImGui::Text("LO Center:   %.4f MHz", current_sidecar_.center_freq_hz / 1e6);
-        ImGui::Text("Sample Rate: %.3f MSPS", current_sidecar_.sample_rate_hz / 1e6);
-        if (current_sidecar_.has_gain) {
-            ImGui::Text("RF Gain:     %.1f dB", current_sidecar_.gain_db);
-        }
-        ImGui::Text("Bias-Tee:    %s", current_sidecar_.bias_tee ? "Enabled" : "Disabled");
-        ImGui::EndChild();
-        ImGui::PopStyleColor();
-    }
-
-    ImGui::Spacing();
-    ImGui::TextColored(ImVec4(0.40f, 0.90f, 1.0f, 1.0f), "DSP & BASELINE CONTROLS");
-    ImGui::Separator();
-
-    ImGui::InputDouble("Center LO (MHz)", &ui_center_freq_mhz_, 0.1, 1.0, "%.6f");
-    ImGui::InputDouble("Sample Rate (MSPS)", &ui_sample_rate_msps_, 0.1, 0.5, "%.3f");
-
-    ImGui::Combo("FFT Size", &ui_fft_size_idx_, FFT_SIZE_NAMES, IM_ARRAYSIZE(FFT_SIZE_NAMES));
-    ImGui::Combo("Baseline Fit", &ui_baseline_idx_, BASELINE_NAMES, IM_ARRAYSIZE(BASELINE_NAMES));
-    if (ImGui::Combo("Colormap", &ui_colormap_idx_, COLORMAP_NAMES, IM_ARRAYSIZE(COLORMAP_NAMES))) {
-        waterfall_texture_dirty_ = true;
-    }
-
-    ImGui::SliderFloat("Tsys (K)", &ui_tsys_k_, 20.0f, 300.0f, "%.1f K");
-    ImGui::InputFloat("Max Duration (s)", &ui_duration_s_, 10.0f, 60.0f, "%.1f");
-    ImGui::SliderFloat("DC Notch (kHz)", &ui_dc_clear_khz_, 1.0f, 25.0f, "%.1f kHz");
-
-    ImGui::EndDisabled();
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    if (is_active_recording) {
-        ImGui::TextColored(ImVec4(1.0f, 0.675f, 0.071f, 1.0f), "⚠️ File is currently being recorded!\n   Stop recording before analyzing.");
-        ImGui::Spacing();
-    }
-
-    // Action Buttons
-    if (is_analyzing_) {
-        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.2f, 0.2f, 1.0f));
-        if (ImGui::Button("Cancel Processing", ImVec2(-1, 38))) {
-            cancel_requested_ = true;
-        }
-        ImGui::PopStyleColor();
-    } else {
-        if (is_active_recording) {
-            ImGui::BeginDisabled();
-            ImGui::Button("RUN SCIENTIFIC ANALYSIS", ImVec2(-1, 40));
-            ImGui::EndDisabled();
-        } else {
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.24f, 0.52f, 0.88f, 1.0f));
-            if (ImGui::Button("RUN SCIENTIFIC ANALYSIS", ImVec2(-1, 40))) {
-                start_analysis();
-            }
-            ImGui::PopStyleColor();
-        }
-    }
-
-    if (has_results_.load()) {
-        ImGui::Spacing();
-        if (is_exporting_.load()) {
-            ImGui::BeginDisabled();
-            ImGui::Button("⏳ Exporting Artifacts...", ImVec2(-1, 34));
-            ImGui::EndDisabled();
-        } else {
-            if (ImGui::Button("Export Plots (PNG) & CSV", ImVec2(-1, 34))) {
-                if (export_thread_ && export_thread_->joinable()) {
-                    export_thread_->join();
-                }
-                is_exporting_ = true;
-                export_status_msg_ = "Exporting publication plots...";
-
-                std::string path = cur_sel_file;
-                if (path.empty()) path = "observation.cs16";
-
-                FileMetadata meta;
-                StreamingResults stream_snap;
-                std::vector<double> rfi_snap, base_snap, cal_k_snap, cal_db_snap;
-                AstrophysicalMetrics met_snap;
-                AstroConfig cfg_snap = config_;
-
-                {
-                    std::lock_guard<std::mutex> lock(data_mutex_);
-                    meta.filepath = path;
-                    meta.filesize = stream_res_.file_size_bytes;
-                    meta.total_samples = stream_res_.total_samples;
-                    meta.duration_s = stream_res_.total_duration_s;
-                    meta.processing_time_s = stream_res_.elapsed_processing_time_s;
-                    meta.throughput_mb_s = stream_res_.throughput_mb_s;
-                    stream_snap = stream_res_;
-                    rfi_snap = rfi_clean_power_;
-                    base_snap = baseline_power_;
-                    cal_k_snap = calibrated_k_;
-                    cal_db_snap = calibrated_db_;
-                    met_snap = metrics_;
-                }
-
-                export_thread_ = std::make_unique<std::thread>([this, path, cfg_snap, meta, stream_snap, rfi_snap, base_snap, cal_k_snap, cal_db_snap, met_snap]() {
-                    try {
-                        Exporter::export_all_artifacts(
-                            cfg_snap.output_dir, path, cfg_snap, meta, stream_snap,
-                            rfi_snap, base_snap, cal_k_snap, cal_db_snap, met_snap
-                        );
-                        export_status_msg_ = "Saved all 5 PNGs & CSV to: " + cfg_snap.output_dir;
-                    } catch (const std::exception& e) {
-                        export_status_msg_ = std::string("Export error: ") + e.what();
-                    }
-                    is_exporting_ = false;
-                });
-            }
+            ctx->Unmap(waterfall_texture_, 0);
         }
 
-        if (!export_status_msg_.empty()) {
-            ImGui::TextColored(ImVec4(0.11f, 0.82f, 0.63f, 1.0f), "%s", export_status_msg_.c_str());
-        }
+        last_uploaded_snap_ = snap.get();
+        last_colormap_idx_ = ui_colormap_idx_;
     }
-
-    ImGui::EndChild();
-}
-
-void UiAnalyzePanel::render_tab_calibrated_spectrum() {
-    if (!has_results_) {
-        ImGui::TextDisabled("Run scientific analysis to view calibrated spectrum.");
-        return;
-    }
-
-    ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
-    ImVec2 canvas_size = ImGui::GetContentRegionAvail();
-    if (canvas_size.x < 100 || canvas_size.y < 100) return;
-
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-
-    draw_list->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(22, 27, 34, 255));
-    draw_list->AddRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + canvas_size.y), IM_COL32(48, 54, 61, 255));
-
-    float margin_left = 60.0f;
-    float margin_right = 20.0f;
-    float margin_top = 40.0f;
-    float margin_bottom = 40.0f;
-
-    float plot_w = canvas_size.x - margin_left - margin_right;
-    float plot_h = canvas_size.y - margin_top - margin_bottom;
-
-    double v_min = -200.0, v_max = 200.0;
-    double k_max = 0.5, k_min = -0.5;
-    for (size_t i = 0; i < vel_kms_.size(); ++i) {
-        if (vel_kms_[i] >= v_min && vel_kms_[i] <= v_max) {
-            k_max = std::max(k_max, calibrated_k_[i]);
-            k_min = std::min(k_min, calibrated_k_[i]);
-        }
-    }
-    k_min = std::max(-1.0, k_min - 0.5);
-    k_max = k_max * 1.35 + 1.0;
-
-    auto map_pt = [&](double v, double k) {
-        float x = canvas_pos.x + margin_left + static_cast<float>((v - v_min) / (v_max - v_min) * plot_w);
-        float y = canvas_pos.y + margin_top + plot_h - static_cast<float>((k - k_min) / (k_max - k_min) * plot_h);
-        return ImVec2(x, y);
-    };
-
-    // Velocity grid lines
-    for (double v = -180; v <= 180; v += 60) {
-        ImVec2 p_top = map_pt(v, k_max);
-        ImVec2 p_bot = map_pt(v, k_min);
-        draw_list->AddLine(p_top, p_bot, IM_COL32(48, 54, 61, 180));
-        char v_str[32];
-        snprintf(v_str, sizeof(v_str), "%+d", static_cast<int>(v));
-        draw_list->AddText(ImVec2(p_bot.x - 12, p_bot.y + 6), IM_COL32(139, 148, 158, 255), v_str);
-    }
-
-    // Zero Kelvin line
-    ImVec2 y0_l = map_pt(v_min, 0.0);
-    ImVec2 y0_r = map_pt(v_max, 0.0);
-    draw_list->AddLine(y0_l, y0_r, IM_COL32(139, 148, 158, 200), 1.0f);
-
-    // Rest frame line v=0
-    ImVec2 x0_t = map_pt(0.0, k_max);
-    ImVec2 x0_b = map_pt(0.0, k_min);
-    draw_list->AddLine(x0_t, x0_b, IM_COL32(116, 185, 255, 220), 1.5f);
-
-    // Spectrum curve (Cyan #00f2fe)
-    for (size_t i = 1; i < vel_kms_.size(); ++i) {
-        if (vel_kms_[i] < v_min || vel_kms_[i - 1] > v_max) continue;
-        ImVec2 p1 = map_pt(vel_kms_[i - 1], calibrated_k_[i - 1]);
-        ImVec2 p2 = map_pt(vel_kms_[i], calibrated_k_[i]);
-        draw_list->AddLine(p1, p2, IM_COL32(0, 242, 254, 255), 2.0f);
-    }
-
-    // Gaussian fit overlay (Pink #ff7675)
-    if (metrics_.gauss_fit.success && !metrics_.gauss_fit.fitted_curve.empty()) {
-        for (size_t i = 1; i < vel_kms_.size(); ++i) {
-            if (vel_kms_[i] < v_min || vel_kms_[i - 1] > v_max) continue;
-            ImVec2 p1 = map_pt(vel_kms_[i - 1], metrics_.gauss_fit.fitted_curve[i - 1]);
-            ImVec2 p2 = map_pt(vel_kms_[i], metrics_.gauss_fit.fitted_curve[i]);
-            draw_list->AddLine(p1, p2, IM_COL32(255, 118, 117, 230), 2.0f);
-        }
-    }
-
-    // Galactic peak centroid
-    ImVec2 peak_pt = map_pt(metrics_.peak_vel_kms, metrics_.peak_temp_k);
-    draw_list->AddCircleFilled(peak_pt, 6.0f, IM_COL32(255, 71, 87, 255));
-    draw_list->AddCircle(peak_pt, 7.0f, IM_COL32(255, 255, 255, 255), 0, 1.5f);
-
-    // Interactive 2D Crosshair Cursor
-    ImVec2 mouse_pos = ImGui::GetMousePos();
-    if (mouse_pos.x >= canvas_pos.x + margin_left && mouse_pos.x <= canvas_pos.x + canvas_size.x - margin_right &&
-        mouse_pos.y >= canvas_pos.y + margin_top && mouse_pos.y <= canvas_pos.y + canvas_size.y - margin_bottom) {
-        
-        draw_list->AddLine(ImVec2(mouse_pos.x, canvas_pos.y + margin_top), ImVec2(mouse_pos.x, canvas_pos.y + margin_top + plot_h), IM_COL32(102, 230, 255, 180), 1.0f);
-        draw_list->AddLine(ImVec2(canvas_pos.x + margin_left, mouse_pos.y), ImVec2(canvas_pos.x + margin_left + plot_w, mouse_pos.y), IM_COL32(102, 230, 255, 180), 1.0f);
-
-        float frac_x = (mouse_pos.x - (canvas_pos.x + margin_left)) / plot_w;
-        float frac_y = (canvas_pos.y + margin_top + plot_h - mouse_pos.y) / plot_h;
-        double cur_v = v_min + frac_x * (v_max - v_min);
-        double cur_k = k_min + frac_y * (k_max - k_min);
-        double cur_f = HYDROGEN_REST_FREQ_MHZ * (1.0 - cur_v / SPEED_OF_LIGHT_KMS);
-
-        ImGui::BeginTooltip();
-        ImGui::TextColored(ImVec4(0.40f, 0.90f, 1.0f, 1.0f), "Doppler Velocity: %+.2f km/s", cur_v);
-        ImGui::Text("Sky Frequency:    %.4f MHz", cur_f);
-        ImGui::Text("Brightness Temp:  %.2f K", cur_k);
-        ImGui::EndTooltip();
-    }
-
-    // HUD Metrics Overlay
-    ImVec2 hud_pos = ImVec2(canvas_pos.x + margin_left + 15, canvas_pos.y + margin_top + 15);
-    draw_list->AddRectFilled(hud_pos, ImVec2(hud_pos.x + 310, hud_pos.y + 140), IM_COL32(30, 39, 46, 230), 4.0f);
-    draw_list->AddRect(hud_pos, ImVec2(hud_pos.x + 310, hud_pos.y + 140), IM_COL32(0, 210, 211, 255), 4.0f, 0, 1.2f);
-
-    char hud_text[512];
-    snprintf(hud_text, sizeof(hud_text),
-             "Peak Frequency:  %.4f MHz\n"
-             "Recession Vel:   %+.2f km/s\n"
-             "Peak Brightness: %.2f K (%+.3f dB)\n"
-             "Noise Floor RMS: %.3f K\n"
-             "Signal SNR:      %.1f sigma\n"
-             "Line FWHM Width: %.1f km/s\n"
-             "Integrated Area: %.1f K*km/s\n"
-             "N_HI Column:     %.2e cm^-2",
-             metrics_.peak_freq_mhz, metrics_.peak_vel_kms,
-             metrics_.peak_temp_k, metrics_.peak_power_db,
-             metrics_.noise_std_k, metrics_.snr,
-             metrics_.fwhm_kms, metrics_.integrated_flux_k_kms,
-             metrics_.column_density_cm2);
-
-    draw_list->AddText(ImVec2(hud_pos.x + 10, hud_pos.y + 8), IM_COL32(241, 242, 246, 255), hud_text);
-}
-
-void UiAnalyzePanel::render_tab_raw_and_baseline() {
-    if (!has_results_) {
-        ImGui::TextDisabled("Run scientific analysis to view passband baseline modeling.");
-        return;
-    }
-
-    ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
-    ImVec2 canvas_size = ImGui::GetContentRegionAvail();
-    if (canvas_size.x < 100 || canvas_size.y < 100) return;
-
-    ImDrawList* draw_list = ImGui::GetWindowDrawList();
-
-    float top_h = canvas_size.y * 0.62f;
-    float bot_h = canvas_size.y * 0.35f;
-
-    draw_list->AddRectFilled(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + top_h), IM_COL32(22, 27, 34, 255));
-    draw_list->AddRect(canvas_pos, ImVec2(canvas_pos.x + canvas_size.x, canvas_pos.y + top_h), IM_COL32(48, 54, 61, 255));
-
-    ImVec2 bot_pos = ImVec2(canvas_pos.x, canvas_pos.y + top_h + 10);
-    draw_list->AddRectFilled(bot_pos, ImVec2(bot_pos.x + canvas_size.x, bot_pos.y + bot_h), IM_COL32(22, 27, 34, 255));
-    draw_list->AddRect(bot_pos, ImVec2(bot_pos.x + canvas_size.x, bot_pos.y + bot_h), IM_COL32(48, 54, 61, 255));
-
-    size_t n = stream_res_.freq_mhz.size();
-    if (n < 2) return;
-
-    double f_min = stream_res_.freq_mhz.front();
-    double f_max = stream_res_.freq_mhz.back();
-
-    auto map_fx = [&](double f) {
-        return canvas_pos.x + 60.0f + static_cast<float>((f - f_min) / (f_max - f_min) * (canvas_size.x - 80.0f));
-    };
-
-    // Shaded outer filter skirts
-    int edge_bins = static_cast<int>(n * config_.passband_edge_fraction);
-    float x_pb_l = map_fx(stream_res_.freq_mhz[edge_bins]);
-    float x_pb_r = map_fx(stream_res_.freq_mhz[n - 1 - edge_bins]);
-
-    draw_list->AddRectFilled(ImVec2(canvas_pos.x + 60, canvas_pos.y + 20), ImVec2(x_pb_l, canvas_pos.y + top_h - 20), IM_COL32(87, 96, 111, 70));
-    draw_list->AddRectFilled(ImVec2(x_pb_r, canvas_pos.y + 20), ImVec2(canvas_pos.x + canvas_size.x - 20, canvas_pos.y + top_h - 20), IM_COL32(87, 96, 111, 70));
-
-    // Protected HI window shaded
-    double hi_half_mhz = config_.hi_protection_half_width_khz / 1e3;
-    float x_hi_l = map_fx(HYDROGEN_REST_FREQ_MHZ - hi_half_mhz);
-    float x_hi_r = map_fx(HYDROGEN_REST_FREQ_MHZ + hi_half_mhz);
-    draw_list->AddRectFilled(ImVec2(x_hi_l, canvas_pos.y + 20), ImVec2(x_hi_r, canvas_pos.y + top_h - 20), IM_COL32(16, 172, 132, 50));
-
-    // DC Notch vertical marker
-    float x_dc = map_fx(config_.center_freq_hz / 1e6);
-    draw_list->AddLine(ImVec2(x_dc, canvas_pos.y + 20), ImVec2(x_dc, canvas_pos.y + top_h - 20), IM_COL32(255, 71, 87, 255), 1.5f);
-
-    // Draw raw vs baseline on top
-    double p_min = 1e9, p_max = -1e9;
-    std::vector<double> raw_db(n);
-    for (size_t i = 0; i < n; ++i) {
-        raw_db[i] = 10.0 * std::log10(std::max(stream_res_.averaged_power[i], 1e-12));
-        p_min = std::min(p_min, raw_db[i]);
-        p_max = std::max(p_max, raw_db[i]);
-    }
-    p_min -= 1.0; p_max += 1.0;
-
-    auto map_py = [&](double p) {
-        return canvas_pos.y + top_h - 30.0f - static_cast<float>((p - p_min) / (p_max - p_min) * (top_h - 60.0f));
-    };
-
-    for (size_t i = 1; i < n; ++i) {
-        ImVec2 r1(map_fx(stream_res_.freq_mhz[i - 1]), map_py(raw_db[i - 1]));
-        ImVec2 r2(map_fx(stream_res_.freq_mhz[i]), map_py(raw_db[i]));
-        draw_list->AddLine(r1, r2, IM_COL32(84, 160, 255, 180), 1.0f);
-
-        ImVec2 b1(map_fx(stream_res_.freq_mhz[i - 1]), map_py(baseline_db_[i - 1]));
-        ImVec2 b2(map_fx(stream_res_.freq_mhz[i]), map_py(baseline_db_[i]));
-        draw_list->AddLine(b1, b2, IM_COL32(255, 159, 67, 255), 2.0f);
-    }
-
-    // Residuals on bottom plot
-    double res_min = -1.0, res_max = 1.0;
-    for (size_t i = 0; i < n; ++i) {
-        double r = calibrated_db_[i];
-        res_min = std::min(res_min, r);
-        res_max = std::max(res_max, r);
-    }
-    res_min -= 0.2; res_max += 0.2;
-
-    auto map_ry = [&](double r) {
-        return bot_pos.y + bot_h - 20.0f - static_cast<float>((r - res_min) / (res_max - res_min) * (bot_h - 40.0f));
-    };
-
-    // Zero residual line
-    float zero_y = map_ry(0.0);
-    draw_list->AddLine(ImVec2(canvas_pos.x + 60, zero_y), ImVec2(canvas_pos.x + canvas_size.x - 20, zero_y), IM_COL32(139, 148, 158, 180), 1.0f);
-
-    for (size_t i = 1; i < n; ++i) {
-        ImVec2 p1(map_fx(stream_res_.freq_mhz[i - 1]), map_ry(calibrated_db_[i - 1]));
-        ImVec2 p2(map_fx(stream_res_.freq_mhz[i]), map_ry(calibrated_db_[i]));
-        draw_list->AddLine(p1, p2, IM_COL32(29, 209, 161, 230), 1.5f);
-    }
-
-    // Labels
-    draw_list->AddText(ImVec2(canvas_pos.x + 70, canvas_pos.y + 25), IM_COL32(255, 255, 255, 255), "Raw Averaged Spectrum (Blue) vs Standing-Wave Baseline Model (Orange)");
-    draw_list->AddText(ImVec2(bot_pos.x + 70, bot_pos.y + 15), IM_COL32(29, 209, 161, 255), "Flattened Passband Residuals P_raw - P_base (dB)");
-}
-
-void UiAnalyzePanel::render_tab_waterfall() {
-    if (!has_results_ || !waterfall_srv_) {
-        ImGui::TextDisabled("Run scientific analysis to view time-frequency waterfall spectrogram.");
-        return;
-    }
-
-    ImVec2 avail = ImGui::GetContentRegionAvail();
-    if (avail.x < 100 || avail.y < 100) return;
-
-    ImGui::Image(reinterpret_cast<ImTextureID>(waterfall_srv_), avail);
-}
-
-void UiAnalyzePanel::render_tab_master_dashboard() {
-    if (!has_results_) {
-        ImGui::TextDisabled("Run scientific analysis to view executive master dashboard.");
-        return;
-    }
-
-    ImGui::TextColored(ImVec4(0.40f, 0.90f, 1.0f, 1.0f), "Executive 4-Panel Master Summary");
-    ImGui::Separator();
-
-    float half_w = (ImGui::GetContentRegionAvail().x - 10) * 0.5f;
-    float half_h = (ImGui::GetContentRegionAvail().y - 10) * 0.5f;
-
-    ImGui::BeginChild("Dash_Q1", ImVec2(half_w, half_h), true);
-    render_tab_raw_and_baseline();
-    ImGui::EndChild();
-
-    ImGui::SameLine();
-    ImGui::BeginChild("Dash_Q2", ImVec2(half_w, half_h), true);
-    render_tab_calibrated_spectrum();
-    ImGui::EndChild();
-
-    ImGui::BeginChild("Dash_Q3", ImVec2(half_w, half_h), true);
-    render_tab_calibrated_spectrum();
-    ImGui::EndChild();
-
-    ImGui::SameLine();
-    ImGui::BeginChild("Dash_Q4", ImVec2(half_w, half_h), true);
-    render_tab_waterfall();
-    ImGui::EndChild();
-}
-
-void UiAnalyzePanel::render_panel(ID3D11DeviceContext* ctx, float width, float height) {
-    // Check if auto-analyze was requested by Record -> Analyze bridge
-    std::string target;
-    if (app_state_.check_and_clear_auto_analyze(target)) {
-        if (!target.empty()) {
-            select_and_run_file(target, true);
-        }
-    }
-
-    std::unique_lock<std::mutex> lock(data_mutex_, std::try_to_lock);
-    bool data_available = has_results_.load() && lock.owns_lock();
-
-    if (data_available) {
-        update_waterfall_texture(ctx);
-    }
-
-    ImGui::BeginChild("AnalyzePanelCanvas", ImVec2(width, height), false, ImGuiWindowFlags_NoScrollbar);
-
-    render_top_bar();
-
-    ImGui::Spacing();
-    render_sidebar_controls();
-
-    ImGui::SameLine();
-    ImGui::BeginChild("AnalyzeMainPlotArea", ImVec2(0, 0), true);
-
-    if (ImGui::BeginTabBar("AnalysisTabs")) {
-        if (ImGui::BeginTabItem("Calibrated HI Spectrum")) {
-            if (data_available) {
-                render_tab_calibrated_spectrum();
-            } else {
-                ImGui::TextDisabled("Run scientific analysis to view calibrated spectrum.");
-            }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Raw Bandpass vs Baseline")) {
-            if (data_available) {
-                render_tab_raw_and_baseline();
-            } else {
-                ImGui::TextDisabled("Run scientific analysis to view passband baseline modeling.");
-            }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Waterfall Spectrogram")) {
-            if (data_available) {
-                render_tab_waterfall();
-            } else {
-                ImGui::TextDisabled("Run scientific analysis to view time-frequency waterfall spectrogram.");
-            }
-            ImGui::EndTabItem();
-        }
-        if (ImGui::BeginTabItem("Master Dashboard")) {
-            if (data_available) {
-                render_tab_master_dashboard();
-            } else {
-                ImGui::TextDisabled("Run scientific analysis to view executive master dashboard.");
-            }
-            ImGui::EndTabItem();
-        }
-        ImGui::EndTabBar();
-    }
-
-    ImGui::EndChild();
-    ImGui::EndChild();
 }
 
 } // namespace astro

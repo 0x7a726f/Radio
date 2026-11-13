@@ -3,6 +3,7 @@
 #include <tlhelp32.h>
 #include <iostream>
 #include <algorithm>
+#include <cmath>
 #include <vector>
 #include <thread>
 #include <chrono>
@@ -43,7 +44,7 @@ bool RtlSdrDevice::load_dll() {
     // Candidates to search for rtlsdr.dll
     std::vector<std::wstring> candidates;
 
-    // Check executable directory
+    // Check executable directory and local bin/PATH
     wchar_t exe_path[MAX_PATH] = {0};
     if (GetModuleFileNameW(nullptr, exe_path, MAX_PATH)) {
         wchar_t* last_slash = wcsrchr(exe_path, L'\\');
@@ -51,13 +52,10 @@ bool RtlSdrDevice::load_dll() {
             *last_slash = L'\0';
             candidates.push_back(std::wstring(exe_path) + L"\\rtlsdr.dll");
             candidates.push_back(std::wstring(exe_path) + L"\\bin\\rtlsdr.dll");
-            candidates.push_back(std::wstring(exe_path) + L"\\..\\Recorder\\rtlsdr.dll");
         }
     }
 
     candidates.push_back(L"rtlsdr.dll");
-    candidates.push_back(L"C:\\Code\\TVRadio\\Recorder\\rtlsdr.dll");
-    candidates.push_back(L"C:\\Code\\TVRadio\\cpp_recorder\\bin\\rtlsdr.dll");
 
     HMODULE mod = nullptr;
     for (const auto& path : candidates) {
@@ -199,8 +197,19 @@ bool RtlSdrDevice::open(uint32_t index) {
     }
 
     dev_ = dev;
-    auto devices = scan_devices();
-    device_name_ = (index < devices.size()) ? devices[index] : "RTL-SDR";
+    {
+        char mfg[256] = {0}, prod[256] = {0}, ser[256] = {0};
+        int usb_ret = fn_get_device_usb_strings ? fn_get_device_usb_strings(index, mfg, prod, ser) : -1;
+        if (usb_ret == 0 && (prod[0] != '\0' || mfg[0] != '\0')) {
+            device_name_ = std::string(mfg) + " " + prod;
+            if (ser[0] != '\0') device_name_ += " #" + std::string(ser);
+        } else if (fn_get_device_name) {
+            const char* name = fn_get_device_name(index);
+            device_name_ = name ? name : ("Generic RTL2832U #" + std::to_string(index));
+        } else {
+            device_name_ = "RTL-SDR #" + std::to_string(index);
+        }
+    }
     status_detail_ = "Connected: " + device_name_;
 
     // Set initial configuration
@@ -293,8 +302,28 @@ bool RtlSdrDevice::set_frequency(uint64_t freq_hz) {
 }
 
 bool RtlSdrDevice::set_gain(float gain_db, bool auto_gain) {
-    gain_db_ = gain_db;
     auto_gain_ = auto_gain;
+    if (!auto_gain) {
+        // Snap requested gain to closest discrete hardware gain step
+        auto valid = get_valid_gains();
+        if (!valid.empty()) {
+            float best = valid.front();
+            float best_diff = std::abs(gain_db - best);
+            for (float g : valid) {
+                float d = std::abs(gain_db - g);
+                if (d < best_diff) {
+                    best_diff = d;
+                    best = g;
+                }
+            }
+            gain_db_ = best;
+        } else {
+            gain_db_ = gain_db;
+        }
+    } else {
+        gain_db_ = gain_db;
+    }
+
     if (dev_ && fn_set_tuner_gain_mode) {
         if (auto_gain) {
             fn_set_tuner_gain_mode(dev_, 0); // AGC auto
@@ -302,7 +331,7 @@ bool RtlSdrDevice::set_gain(float gain_db, bool auto_gain) {
         } else {
             fn_set_tuner_gain_mode(dev_, 1); // Manual
             if (fn_set_tuner_gain) {
-                return (fn_set_tuner_gain(dev_, (int)(gain_db * 10.0f)) == 0);
+                return (fn_set_tuner_gain(dev_, static_cast<int>(std::lround(gain_db_ * 10.0f))) == 0);
             }
         }
     }

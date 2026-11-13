@@ -67,7 +67,7 @@ public:
 
     // Callbacks
     void add_sample_callback(SampleCallback cb);
-    void set_freq_changed_callback(FreqChangedCallback cb) { freq_changed_cb_ = cb; }
+    void set_freq_changed_callback(FreqChangedCallback cb);
 
     // Lock-Free Ring Buffer Telemetry
     float get_ring_buffer_fill_pct() const { return ring_buffer_.fill_percentage(); }
@@ -78,13 +78,17 @@ public:
     static std::vector<std::string> check_blocking_apps();
 
 private:
+    void stop_workers_locked();
     void stream_worker();
+    void dispatch_worker();
     void process_pending_commands();
 
     std::unique_ptr<ISdrDevice> device_;
     std::atomic<bool> is_streaming_{false};
     std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> dispatch_stop_{false};
     std::thread worker_thread_;
+    std::thread dispatcher_thread_;
 
     std::atomic<uint64_t> current_freq_{SdrConstants::DEFAULT_CENTER_FREQ_HZ};
     std::atomic<uint32_t> current_rate_{SdrConstants::DEFAULT_SAMPLE_RATE_HZ};
@@ -95,7 +99,11 @@ private:
     std::atomic<bool> is_simulated_{true};
 
     // Lifecycle & device access mutex
-    std::mutex lifecycle_mutex_;
+    mutable std::mutex lifecycle_mutex_;
+
+    // Dispatcher wakeup synchronization
+    std::mutex dispatch_mutex_;
+    std::condition_variable dispatch_cv_;
 
     // Thread-safe command queue
     std::mutex cmd_mutex_;
@@ -107,5 +115,6 @@ private:
     FreqChangedCallback freq_changed_cb_;
 
     std::vector<uint8_t> rx_buffer_;
+    std::vector<uint8_t> dispatch_buf_;
     LockFreeSpscRingBuffer<uint8_t> ring_buffer_{SdrConstants::RING_BUFFER_CAPACITY};
 };

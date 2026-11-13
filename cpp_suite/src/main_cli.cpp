@@ -308,11 +308,9 @@ int run_analyze(int argc, char* argv[], int start_idx) {
         std::vector<std::string> search_dirs = {
             ".",
             "recordings",
+            "bin/recordings",
             "../recordings",
-            "cpp_recorder/recordings",
-            "../cpp_recorder/recordings",
-            "Analyzer",
-            "../Analyzer"
+            "../bin/recordings"
         };
         auto discovered = SidecarReader::scan_cs16_files(search_dirs);
         if (!discovered.empty()) {

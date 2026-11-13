@@ -6,22 +6,33 @@
 #include <iostream>
 
 SdrController::SdrController()
-    : rx_buffer_(SdrConstants::SDR_CHUNK_BYTES) {
+    : rx_buffer_(SdrConstants::SDR_CHUNK_BYTES),
+      dispatch_buf_(SdrConstants::SDR_CHUNK_BYTES) {
 }
 
 SdrController::~SdrController() {
     shutdown();
 }
 
+void SdrController::stop_workers_locked() {
+    is_streaming_ = false;
+    stop_requested_ = true;
+    if (worker_thread_.joinable()) {
+        worker_thread_.join();
+    }
+    {
+        std::lock_guard<std::mutex> dlk(dispatch_mutex_);
+        dispatch_stop_ = true;
+    }
+    dispatch_cv_.notify_all();
+    if (dispatcher_thread_.joinable()) {
+        dispatcher_thread_.join();
+    }
+}
+
 bool SdrController::initialize(bool force_virtual, uint32_t device_index) {
     std::lock_guard<std::mutex> lk(lifecycle_mutex_);
-    if (is_streaming_) {
-        is_streaming_ = false;
-        stop_requested_ = true;
-        if (worker_thread_.joinable()) {
-            worker_thread_.join();
-        }
-    }
+    stop_workers_locked();
     if (device_) {
         device_->close();
         device_.reset();
@@ -61,13 +72,7 @@ bool SdrController::initialize(bool force_virtual, uint32_t device_index) {
 
 void SdrController::shutdown() {
     std::lock_guard<std::mutex> lk(lifecycle_mutex_);
-    if (is_streaming_) {
-        is_streaming_ = false;
-        stop_requested_ = true;
-        if (worker_thread_.joinable()) {
-            worker_thread_.join();
-        }
-    }
+    stop_workers_locked();
     if (device_) {
         device_->close();
         device_.reset();
@@ -77,6 +82,8 @@ void SdrController::shutdown() {
 bool SdrController::start_streaming() {
     std::lock_guard<std::mutex> lk(lifecycle_mutex_);
     if (is_streaming_) return true;
+    stop_workers_locked();
+
     if (!device_) {
         auto dev = std::make_unique<RtlSdrDevice>();
         if (dev->open(0)) {
@@ -90,22 +97,19 @@ bool SdrController::start_streaming() {
         }
     }
 
+    ring_buffer_.reset();
     stop_requested_ = false;
+    dispatch_stop_ = false;
     is_streaming_ = true;
+    dispatcher_thread_ = std::thread(&SdrController::dispatch_worker, this);
     worker_thread_ = std::thread(&SdrController::stream_worker, this);
     return true;
 }
 
 void SdrController::stop_streaming() {
     std::lock_guard<std::mutex> lk(lifecycle_mutex_);
-    if (!is_streaming_) return;
-
-    is_streaming_ = false;
-    stop_requested_ = true;
-
-    if (worker_thread_.joinable()) {
-        worker_thread_.join();
-    }
+    if (!is_streaming_ && !worker_thread_.joinable() && !dispatcher_thread_.joinable()) return;
+    stop_workers_locked();
 }
 
 std::future<bool> SdrController::request_frequency(uint64_t freq_hz) {
@@ -220,20 +224,28 @@ std::future<bool> SdrController::request_ppm(int ppm) {
 }
 
 std::string SdrController::get_device_name() const {
+    std::lock_guard<std::mutex> lk(lifecycle_mutex_);
     return device_ ? device_->get_name() : "None";
 }
 
 std::string SdrController::get_status_detail() const {
+    std::lock_guard<std::mutex> lk(lifecycle_mutex_);
     return device_ ? device_->get_status_detail() : "Disconnected";
 }
 
 std::vector<float> SdrController::get_valid_gains() {
+    std::lock_guard<std::mutex> lk(lifecycle_mutex_);
     return device_ ? device_->get_valid_gains() : std::vector<float>();
 }
 
 void SdrController::add_sample_callback(SampleCallback cb) {
     std::lock_guard<std::mutex> lock(cb_mutex_);
-    sample_callbacks_.push_back(cb);
+    sample_callbacks_.push_back(std::move(cb));
+}
+
+void SdrController::set_freq_changed_callback(FreqChangedCallback cb) {
+    std::lock_guard<std::mutex> lock(cb_mutex_);
+    freq_changed_cb_ = std::move(cb);
 }
 
 std::vector<std::string> SdrController::scan_all_devices() {
@@ -296,8 +308,13 @@ void SdrController::process_pending_commands() {
                         success = device_->set_frequency(cmd.uint_param);
                         uint64_t actual = device_->get_frequency();
                         current_freq_.store(actual);
-                        if (freq_changed_cb_) {
-                            freq_changed_cb_(actual);
+                        FreqChangedCallback cb_copy;
+                        {
+                            std::lock_guard<std::mutex> clk(cb_mutex_);
+                            cb_copy = freq_changed_cb_;
+                        }
+                        if (cb_copy) {
+                            cb_copy(actual);
                         }
                         break;
                     }
@@ -362,15 +379,42 @@ void SdrController::stream_worker() {
         int bytes_read = 0;
         int ret = device_->read_samples(rx_buffer_.data(), (int)rx_buffer_.size(), &bytes_read);
         if (ret == 0 && bytes_read > 0) {
-            // High-throughput lock-free SPSC buffer ingestion
+            // Producer pushes solely to lock-free SPSC ring buffer; dispatch_worker drains and runs callbacks
             ring_buffer_.write_lossy(rx_buffer_.data(), (size_t)bytes_read);
-
-            std::lock_guard<std::mutex> lock(cb_mutex_);
-            for (auto& cb : sample_callbacks_) {
-                cb(rx_buffer_.data(), (size_t)bytes_read);
-            }
+            dispatch_cv_.notify_one();
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+}
+
+void SdrController::dispatch_worker() {
+    std::vector<SampleCallback> local_cbs;
+    while (true) {
+        size_t avail = ring_buffer_.available_read();
+        if (avail == 0) {
+            std::unique_lock<std::mutex> dlk(dispatch_mutex_);
+            if (dispatch_stop_.load() && ring_buffer_.available_read() == 0) {
+                break;
+            }
+            dispatch_cv_.wait_for(dlk, std::chrono::milliseconds(5), [&]() {
+                return dispatch_stop_.load() || ring_buffer_.available_read() > 0;
+            });
+            if (dispatch_stop_.load() && ring_buffer_.available_read() == 0) {
+                break;
+            }
+            continue;
+        }
+
+        size_t got = ring_buffer_.read(dispatch_buf_.data(), dispatch_buf_.size());
+        if (got > 0) {
+            {
+                std::lock_guard<std::mutex> clk(cb_mutex_);
+                local_cbs = sample_callbacks_;
+            }
+            for (auto& cb : local_cbs) {
+                cb(dispatch_buf_.data(), got);
+            }
         }
     }
 }

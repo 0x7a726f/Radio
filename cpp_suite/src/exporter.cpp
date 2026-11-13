@@ -1,11 +1,14 @@
 #include "exporter.h"
 #include "plot_renderer.h"
+#include "simd_dsp.h"
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <cmath>
 #include <filesystem>
 #include <iostream>
+#include <future>
+#include <cstdio>
 
 namespace astro {
 
@@ -25,27 +28,39 @@ bool Exporter::export_csv(
         std::filesystem::create_directories(p.parent_path(), ec);
     }
 
-    std::ofstream f(output_path);
+    std::ofstream f(output_path, std::ios::binary);
     if (!f.is_open()) return false;
 
-    f << "Frequency_Hz,Frequency_MHz,Doppler_Velocity_kms,Raw_Power_dB,Baseline_Power_dB,Calibrated_Power_dB,Antenna_Temperature_K\n";
-    f << std::fixed;
+    const size_t n = freqs_hz.size();
+    std::vector<double> raw_db(n), base_db(n);
+    SimdDsp::power_to_db_f64(raw_power.data(), raw_db.data(), n, 1e-12);
+    SimdDsp::power_to_db_f64(baseline_power.data(), base_db.data(), n, 1e-12);
 
-    size_t n = freqs_hz.size();
+    std::string out_buf;
+    out_buf.reserve(65536);
+    out_buf = "Frequency_Hz,Frequency_MHz,Doppler_Velocity_kms,Raw_Power_dB,Baseline_Power_dB,Calibrated_Power_dB,Antenna_Temperature_K\n";
+
+    char line_buf[256];
     for (size_t i = 0; i < n; ++i) {
-        double raw_db = 10.0 * std::log10(std::max(raw_power[i], 1e-12));
-        double base_db = 10.0 * std::log10(std::max(baseline_power[i], 1e-12));
-
-        f << std::setprecision(3) << freqs_hz[i] << ","
-          << std::setprecision(6) << freqs_mhz[i] << ","
-          << std::setprecision(3) << vel_kms[i] << ","
-          << std::setprecision(4) << raw_db << ","
-          << std::setprecision(4) << base_db << ","
-          << std::setprecision(4) << calibrated_db[i] << ","
-          << std::setprecision(4) << calibrated_k[i] << "\n";
+        int len = std::snprintf(
+            line_buf, sizeof(line_buf),
+            "%.3f,%.6f,%.3f,%.4f,%.4f,%.4f,%.4f\n",
+            freqs_hz[i], freqs_mhz[i], vel_kms[i],
+            raw_db[i], base_db[i], calibrated_db[i], calibrated_k[i]
+        );
+        if (len > 0) {
+            out_buf.append(line_buf, static_cast<size_t>(len));
+            if (out_buf.size() >= 60000) {
+                f.write(out_buf.data(), static_cast<std::streamsize>(out_buf.size()));
+                out_buf.clear();
+            }
+        }
+    }
+    if (!out_buf.empty()) {
+        f.write(out_buf.data(), static_cast<std::streamsize>(out_buf.size()));
     }
 
-    return true;
+    return f.good();
 }
 
 bool Exporter::export_json(
@@ -224,21 +239,39 @@ bool Exporter::export_all_artifacts(
 
     std::vector<double> vel_kms = Astrophysics::compute_doppler_velocity(stream_res.freq_hz);
 
-    PlotRenderer::render_calibrated_spectrum(stream_res.freq_mhz, vel_kms, calibrated_k, calibrated_db, metrics, config, p1);
-    PlotRenderer::render_raw_and_baseline(stream_res.freq_mhz, raw_power, baseline_power, metrics, config, p2);
-    PlotRenderer::render_doppler_profile(vel_kms, calibrated_k, metrics, config, p3);
-    PlotRenderer::render_waterfall_plot(stream_res.waterfall_data, stream_res.waterfall_rows, stream_res.waterfall_cols, stream_res.waterfall_times, stream_res.freq_mhz, baseline_power, config, p4);
-    PlotRenderer::render_master_dashboard(stream_res.freq_mhz, vel_kms, raw_power, baseline_power, calibrated_k, calibrated_db, stream_res.waterfall_data, stream_res.waterfall_rows, stream_res.waterfall_cols, stream_res.waterfall_times, metrics, config, source_file, p5);
+    // Launch all 5 PNG plot renders + encodings concurrently while writing text/CSV reports
+    auto f1 = std::async(std::launch::async, [&]() {
+        return PlotRenderer::render_calibrated_spectrum(stream_res.freq_mhz, vel_kms, calibrated_k, calibrated_db, metrics, config, p1);
+    });
+    auto f2 = std::async(std::launch::async, [&]() {
+        return PlotRenderer::render_raw_and_baseline(stream_res.freq_mhz, raw_power, baseline_power, metrics, config, p2);
+    });
+    auto f3 = std::async(std::launch::async, [&]() {
+        return PlotRenderer::render_doppler_profile(vel_kms, calibrated_k, metrics, config, p3);
+    });
+    auto f4 = std::async(std::launch::async, [&]() {
+        return PlotRenderer::render_waterfall_plot(stream_res.waterfall_data, stream_res.waterfall_rows, stream_res.waterfall_cols, stream_res.waterfall_times, stream_res.freq_mhz, baseline_power, config, p4);
+    });
+    auto f5 = std::async(std::launch::async, [&]() {
+        return PlotRenderer::render_master_dashboard(stream_res.freq_mhz, vel_kms, raw_power, baseline_power, calibrated_k, calibrated_db, stream_res.waterfall_data, stream_res.waterfall_rows, stream_res.waterfall_cols, stream_res.waterfall_times, metrics, config, source_file, p5);
+    });
 
     std::string csv_path = (out / "calibrated_spectrum.csv").string();
     std::string txt_path = (out / "analysis_report.txt").string();
     std::string json_path = (out / "analysis_report.json").string();
 
-    export_csv(stream_res.freq_hz, stream_res.freq_mhz, vel_kms, raw_power, baseline_power, calibrated_k, calibrated_db, csv_path);
-    export_summary_text(metrics, config, meta, txt_path);
-    export_json(metrics, config, meta, json_path);
+    bool ok = true;
+    ok &= export_csv(stream_res.freq_hz, stream_res.freq_mhz, vel_kms, raw_power, baseline_power, calibrated_k, calibrated_db, csv_path);
+    ok &= export_summary_text(metrics, config, meta, txt_path);
+    ok &= export_json(metrics, config, meta, json_path);
 
-    return true;
+    ok &= f1.get();
+    ok &= f2.get();
+    ok &= f3.get();
+    ok &= f4.get();
+    ok &= f5.get();
+
+    return ok;
 }
 
 } // namespace astro

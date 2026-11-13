@@ -1,10 +1,11 @@
 #include "rfi_filter.h"
 #include <cmath>
 #include <algorithm>
+#include <cstring>
 
 namespace astro {
 
-static double calc_median(std::vector<double> v) {
+static double calc_median_inplace(std::vector<double>& v) {
     if (v.empty()) return 0.0;
     size_t n = v.size();
     size_t mid = n / 2;
@@ -12,9 +13,16 @@ static double calc_median(std::vector<double> v) {
     if (n % 2 != 0) {
         return v[mid];
     } else {
-        std::nth_element(v.begin(), v.begin() + mid - 1, v.end());
-        return (v[mid - 1] + v[mid]) * 0.5;
+        auto left_max = std::max_element(v.begin(), v.begin() + mid);
+        return (*left_max + v[mid]) * 0.5;
     }
+}
+
+static inline double calc_median_15(const double* src) {
+    double win[15];
+    std::memcpy(win, src, 15 * sizeof(double));
+    std::nth_element(win, win + 7, win + 15);
+    return win[7];
 }
 
 std::vector<double> RFIFilter::mitigate(
@@ -31,52 +39,44 @@ std::vector<double> RFIFilter::mitigate(
     double hi_half_width_mhz = config.hi_protection_half_width_khz / 1e3;
     int edge_bins = static_cast<int>(nfft * 0.05);
 
-    std::vector<bool> valid_mask(nfft, true);
-    for (int i = 0; i < edge_bins; ++i) valid_mask[i] = false;
-    for (int i = nfft - edge_bins; i < nfft; ++i) valid_mask[i] = false;
+    std::vector<uint8_t> valid_mask(nfft, 1);
+    for (int i = 0; i < edge_bins; ++i) valid_mask[i] = 0;
+    for (int i = nfft - edge_bins; i < nfft; ++i) valid_mask[i] = 0;
 
     for (int i = 0; i < nfft; ++i) {
         if (freqs_mhz[i] >= (HYDROGEN_REST_FREQ_MHZ - hi_half_width_mhz) &&
             freqs_mhz[i] <= (HYDROGEN_REST_FREQ_MHZ + hi_half_width_mhz)) {
-            valid_mask[i] = false; // Protected HI window
+            valid_mask[i] = 0; // Protected HI window
         }
     }
 
-    // Rolling median filter (kernel size = 15)
-    const int kernel_size = 15;
-    const int pad_width = kernel_size / 2;
+    // Rolling median filter (kernel size = 15) with zero heap allocs per bin
+    constexpr int kernel_size = 15;
+    constexpr int pad_width = kernel_size / 2;
     std::vector<double> padded(nfft + 2 * pad_width);
     for (int i = 0; i < pad_width; ++i) padded[i] = clean_power[0];
-    for (int i = 0; i < nfft; ++i) padded[pad_width + i] = clean_power[i];
+    std::memcpy(padded.data() + pad_width, clean_power.data(), static_cast<size_t>(nfft) * sizeof(double));
     for (int i = 0; i < pad_width; ++i) padded[pad_width + nfft + i] = clean_power[nfft - 1];
-
-    std::vector<double> rolling_median(nfft);
-    std::vector<double> window_buf(kernel_size);
-    for (int i = 0; i < nfft; ++i) {
-        for (int k = 0; k < kernel_size; ++k) {
-            window_buf[k] = padded[i + k];
-        }
-        rolling_median[i] = calc_median(window_buf);
-    }
 
     std::vector<double> residuals(nfft);
     std::vector<double> residuals_valid;
     residuals_valid.reserve(nfft);
     for (int i = 0; i < nfft; ++i) {
-        residuals[i] = clean_power[i] - rolling_median[i];
+        double med = calc_median_15(&padded[i]);
+        double res = clean_power[i] - med;
+        residuals[i] = res;
         if (valid_mask[i]) {
-            residuals_valid.push_back(residuals[i]);
+            residuals_valid.push_back(res);
         }
     }
 
     if (residuals_valid.empty()) return clean_power;
 
-    double med_res = calc_median(residuals_valid);
-    std::vector<double> abs_diffs(residuals_valid.size());
-    for (size_t i = 0; i < residuals_valid.size(); ++i) {
-        abs_diffs[i] = std::abs(residuals_valid[i] - med_res);
+    double med_res = calc_median_inplace(residuals_valid);
+    for (double& r : residuals_valid) {
+        r = std::abs(r - med_res);
     }
-    double mad = calc_median(abs_diffs);
+    double mad = calc_median_inplace(residuals_valid);
     double sigma_est = std::max(1e-12, 1.4826 * mad);
 
     double threshold = config.rfi_threshold_mad * sigma_est;

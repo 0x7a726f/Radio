@@ -47,6 +47,12 @@ public:
         const std::vector<bool>& hi_window
     );
 
+    static GaussianFit fit_gaussian(
+        const std::vector<double>& vel_kms,
+        const std::vector<double>& temp_k,
+        const std::vector<uint8_t>& hi_window
+    );
+
     // Compute comprehensive astrophysical metrics
     static AstrophysicalMetrics calculate_metrics(
         const std::vector<double>& freqs_mhz,

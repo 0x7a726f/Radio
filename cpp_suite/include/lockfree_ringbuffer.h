@@ -146,15 +146,14 @@ public:
     }
 
     size_t available_read() const {
+        const size_t current_read = read_idx_.load(std::memory_order_acquire);
         const size_t current_write = write_idx_.load(std::memory_order_acquire);
-        const size_t current_read = read_idx_.load(std::memory_order_relaxed);
-        return current_write - current_read;
+        return (current_write >= current_read) ? (current_write - current_read) : 0;
     }
 
     size_t available_write() const {
-        const size_t current_write = write_idx_.load(std::memory_order_relaxed);
-        const size_t current_read = read_idx_.load(std::memory_order_acquire);
-        return capacity_ - (current_write - current_read);
+        const size_t avail = available_read();
+        return (avail <= capacity_) ? (capacity_ - avail) : 0;
     }
 
     size_t capacity() const { return capacity_; }

@@ -1,15 +1,22 @@
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <windows.h>
 #include <d3d11.h>
 #include <tchar.h>
+#include <algorithm>
 
 #include "../lib/imgui/imgui.h"
 #include "../lib/imgui/imgui_impl_win32.h"
 #include "../lib/imgui/imgui_impl_dx11.h"
 
 #include "app_gui.h"
+#include "constants.h"
 
-// Forward declare message handler from imgui_impl_win32.cpp
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 static ID3D11Device* g_pd3dDevice = nullptr;
@@ -93,8 +100,22 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
             g_ResizeWidth = (UINT)LOWORD(lParam);
             g_ResizeHeight = (UINT)HIWORD(lParam);
             return 0;
+        case WM_DPICHANGED: {
+            if (ImGui::GetCurrentContext() != nullptr) {
+                ImGui::GetStyle().FontScaleDpi = static_cast<float>(LOWORD(wParam)) / 96.0f;
+            }
+            RECT* const suggested = reinterpret_cast<RECT*>(lParam);
+            if (suggested) {
+                SetWindowPos(hWnd, nullptr,
+                             suggested->left, suggested->top,
+                             suggested->right - suggested->left,
+                             suggested->bottom - suggested->top,
+                             SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            return 0;
+        }
         case WM_SYSCOMMAND:
-            if ((wParam & 0xfff0) == SC_KEYMENU) // Disable ALT application menu
+            if ((wParam & 0xfff0) == SC_KEYMENU)
                 return 0;
             break;
         case WM_DESTROY:
@@ -105,19 +126,33 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
-    // 1. Create native Win32 window
+    ImGui_ImplWin32_EnableDpiAwareness();
+
     WNDCLASSEXW wc = {
         sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, hInstance, nullptr, nullptr, nullptr, nullptr,
-        L"SatDumpUnifiedSuiteClass", nullptr
+        L"ObservatorySuiteClass", nullptr
     };
     RegisterClassExW(&wc);
+
+    float init_dpi = ImGui_ImplWin32_GetDpiScaleForMonitor(
+        ::MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY));
+    if (init_dpi < 1.0f) init_dpi = 1.0f;
+
+    RECT work_area{0, 0, 1920, 1080};
+    SystemParametersInfoW(SPI_GETWORKAREA, 0, &work_area, 0);
+    int max_w = std::max(800, static_cast<int>((work_area.right - work_area.left) - 40));
+    int max_h = std::max(600, static_cast<int>((work_area.bottom - work_area.top) - 40));
+    int win_w = std::min(max_w, static_cast<int>(1440.0f * init_dpi));
+    int win_h = std::min(max_h, static_cast<int>(920.0f * init_dpi));
+    int win_x = static_cast<int>(work_area.left) + std::max(0, (max_w + 40 - win_w) / 2);
+    int win_y = static_cast<int>(work_area.top) + std::max(0, (max_h + 40 - win_h) / 2);
+
     HWND hwnd = CreateWindowW(
         wc.lpszClassName,
-        L"Radio Astronomy SDR & Scientific Analysis Suite (SatDump UI)",
-        WS_OVERLAPPEDWINDOW, 100, 80, 1400, 880, nullptr, nullptr, wc.hInstance, nullptr
+        L"Observatory Suite - 21cm Hydrogen Line SDR & Analysis",
+        WS_OVERLAPPEDWINDOW, win_x, win_y, win_w, win_h, nullptr, nullptr, wc.hInstance, nullptr
     );
 
-    // 2. Initialize Direct3D 11
     if (!CreateDeviceD3D(hwnd)) {
         CleanupDeviceD3D();
         UnregisterClassW(wc.lpszClassName, wc.hInstance);
@@ -127,20 +162,21 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ShowWindow(hwnd, nCmdShow);
     UpdateWindow(hwnd);
 
-    // 3. Setup Dear ImGui context
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigDpiScaleFonts = true;
+    io.IniFilename = nullptr;
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+    ImGui::GetStyle().FontScaleDpi = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd);
 
-    // 4. Initialize Core Unified GUI
     AppGui gui;
+    gui.set_owner_hwnd(hwnd);
     gui.init_d3d_resources(g_pd3dDevice);
 
-    // 5. Main message and render loop
     bool done = false;
     while (!done) {
         MSG msg;
@@ -152,7 +188,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         }
         if (done) break;
 
-        // Handle window resize
         if (g_ResizeWidth != 0 && g_ResizeHeight != 0) {
             CleanupRenderTarget();
             g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
@@ -160,12 +195,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
             g_ResizeWidth = g_ResizeHeight = 0;
         }
 
-        // Start ImGui frame
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        // Render application UI
         RECT rect;
         GetClientRect(hwnd, &rect);
         float width = static_cast<float>(rect.right - rect.left);
@@ -173,20 +206,19 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
         gui.render_frame(g_pd3dDeviceContext, width, height);
 
-        // Rendering to DX11
         ImGui::Render();
-        const float clear_color[4] = {0.059f, 0.059f, 0.059f, 1.0f}; // SatDump background
+        const float clear_color[4] = {
+            astro::theme::BG_R, astro::theme::BG_G, astro::theme::BG_B, astro::theme::BG_A
+        };
         if (g_mainRenderTargetView) {
             g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
             g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color);
         }
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-        // Present with VSync
         g_pSwapChain->Present(1, 0);
     }
 
-    // 6. Graceful Cleanup
     gui.release_d3d_resources();
 
     ImGui_ImplDX11_Shutdown();
@@ -200,7 +232,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     return 0;
 }
 
-// Support console subsystem entry point if compiled or linked with main()
 int main(int argc, char** argv) {
+    (void)argc;
+    (void)argv;
     return WinMain(GetModuleHandle(nullptr), nullptr, GetCommandLineA(), SW_SHOWDEFAULT);
 }

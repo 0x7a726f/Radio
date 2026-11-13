@@ -50,6 +50,8 @@ void DspPipeline::rebuild_plans() {
     power_raw_.resize(fft_size_);
     power_smooth_.assign(fft_size_, -120.0f);
     scratch_u8_.resize(static_cast<size_t>(fft_size_) * 2);
+    sample_buffer_.reserve(static_cast<size_t>(fft_size_) * 2);
+    telemetry_scratch_.reserve(static_cast<size_t>(fft_size_) / 16 + 2);
     has_smooth_ = false;
 
     update_window();
@@ -80,15 +82,14 @@ void DspPipeline::feed_samples(const uint8_t* data, size_t length) {
 void DspPipeline::compute_telemetry(const std::vector<float>& power, float peak_db) {
     if (power.empty()) return;
 
-    // Estimate noise floor by taking the 20th-percentile or median of bins away from center
-    // We sample every 16th bin for sub-microsecond execution
-    std::vector<float> samples;
-    samples.reserve(power.size() / 16 + 1);
+    // Estimate noise floor by taking the 25th-percentile of decimated bins
+    telemetry_scratch_.clear();
     for (size_t i = 0; i < power.size(); i += 16) {
-        samples.push_back(power[i]);
+        telemetry_scratch_.push_back(power[i]);
     }
-    std::nth_element(samples.begin(), samples.begin() + samples.size() / 4, samples.end());
-    float noise_floor = samples[samples.size() / 4];
+    const size_t q1_idx = telemetry_scratch_.size() / 4;
+    std::nth_element(telemetry_scratch_.begin(), telemetry_scratch_.begin() + q1_idx, telemetry_scratch_.end());
+    float noise_floor = telemetry_scratch_[q1_idx];
 
     noise_floor_db_.store(noise_floor, std::memory_order_relaxed);
     float snr = std::max(0.0f, peak_db - noise_floor);

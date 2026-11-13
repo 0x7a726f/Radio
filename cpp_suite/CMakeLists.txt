@@ -67,6 +67,7 @@ set(WINDOWS_LIBS
     gdi32
     shell32
     psapi
+    comdlg32
 )
 
 # ----------------------------------------------------------------------
@@ -154,4 +155,13 @@ elseif (MSVC)
     target_link_libraries(test_performance_stress PRIVATE ${WINDOWS_LIBS})
 endif()
 add_test(NAME test_performance_stress COMMAND test_performance_stress)
+
+add_executable(test_dsp_optimizations ${CORE_SOURCES} tests/test_dsp_optimizations.cpp)
+if (MINGW)
+    target_link_options(test_dsp_optimizations PRIVATE -static -static-libgcc -static-libstdc++)
+    target_link_libraries(test_dsp_optimizations PRIVATE ${WINDOWS_LIBS})
+elseif (MSVC)
+    target_link_libraries(test_dsp_optimizations PRIVATE ${WINDOWS_LIBS})
+endif()
+add_test(NAME test_dsp_optimizations COMMAND test_dsp_optimizations)
 

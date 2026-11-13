@@ -40,7 +40,7 @@ echo ======================================================================
 echo   [BUILD PHASE] Compiling Test Executables...
 echo ======================================================================
 
-echo [1/4] Compiling test_suite_state.exe...
+echo [1/5] Compiling test_suite_state.exe...
 g++ -std=c++17 -O3 -mavx2 -mfma -msse4.1 ^
     -Iinclude ^
     tests/test_suite_state.cpp ^
@@ -51,7 +51,7 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo [2/4] Compiling test_end_to_end_bridge.exe...
+echo [2/5] Compiling test_end_to_end_bridge.exe...
 g++ -std=c++17 -O3 -mavx2 -mfma -msse4.1 ^
     -Iinclude -Ilib -Ilib/kissfft -Ilib/rtlsdr -Ilib/stb ^
     %CORE_SRCS% ^
@@ -64,7 +64,7 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo [3/4] Compiling test_cli_commands.exe...
+echo [3/5] Compiling test_cli_commands.exe...
 g++ -std=c++17 -O3 -mavx2 -mfma -msse4.1 ^
     -Iinclude ^
     tests/test_cli_commands.cpp ^
@@ -75,7 +75,7 @@ if %ERRORLEVEL% neq 0 (
     exit /b 1
 )
 
-echo [4/4] Compiling test_performance_stress.exe...
+echo [4/5] Compiling test_performance_stress.exe...
 g++ -std=c++17 -O3 -mavx2 -mfma -msse4.1 ^
     -Iinclude -Ilib -Ilib/kissfft -Ilib/rtlsdr -Ilib/stb ^
     %CORE_SRCS% ^
@@ -85,6 +85,19 @@ g++ -std=c++17 -O3 -mavx2 -mfma -msse4.1 ^
     -lole32 -lkernel32 -luser32 -lpsapi
 if %ERRORLEVEL% neq 0 (
     echo [ERROR] Failed to compile test_performance_stress.exe!
+    exit /b 1
+)
+
+echo [5/5] Compiling test_dsp_optimizations.exe...
+g++ -std=c++17 -O3 -mavx2 -mfma -msse4.1 ^
+    -Iinclude -Ilib -Ilib/kissfft -Ilib/rtlsdr -Ilib/stb ^
+    %CORE_SRCS% ^
+    tests/test_dsp_optimizations.cpp ^
+    -static -static-libgcc -static-libstdc++ ^
+    -o bin/test_dsp_optimizations.exe ^
+    -lole32 -lkernel32 -luser32 -lpsapi
+if %ERRORLEVEL% neq 0 (
+    echo [ERROR] Failed to compile test_dsp_optimizations.exe!
     exit /b 1
 )
 
@@ -137,10 +150,20 @@ if %ERRORLEVEL% neq 0 (
 )
 
 echo.
+echo [RUN] bin\test_dsp_optimizations.exe
+bin\test_dsp_optimizations.exe
+if %ERRORLEVEL% neq 0 (
+    echo [FAIL] test_dsp_optimizations failed.
+    set /a TESTS_FAILED+=1
+) else (
+    echo [PASS] test_dsp_optimizations passed successfully.
+)
+
+echo.
 echo ======================================================================
 if %TESTS_FAILED% equ 0 (
-    echo   ALL 4 AUTOMATED TEST SUITES PASSED [100%%]
-    echo   Validation, Integration Bridge, CLI, and Performance Benchmarks OK.
+    echo   ALL 5 AUTOMATED TEST SUITES PASSED [100%%]
+    echo   Validation, Bridge, CLI, Performance Benchmarks, and DSP Unit Tests OK.
     echo ======================================================================
     exit /b 0
 ) else (

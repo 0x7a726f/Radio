@@ -3,14 +3,16 @@
 #include <algorithm>
 #include <numeric>
 #include <iostream>
+#include <cstdint>
 
 namespace astro {
 
 std::vector<double> Astrophysics::compute_doppler_velocity(const std::vector<double>& freqs_hz) {
     size_t n = freqs_hz.size();
     std::vector<double> v(n);
+    constexpr double inv_rest_c = SPEED_OF_LIGHT_KMS / HYDROGEN_REST_FREQ_HZ;
     for (size_t i = 0; i < n; ++i) {
-        v[i] = SPEED_OF_LIGHT_KMS * ((HYDROGEN_REST_FREQ_HZ - freqs_hz[i]) / HYDROGEN_REST_FREQ_HZ);
+        v[i] = (HYDROGEN_REST_FREQ_HZ - freqs_hz[i]) * inv_rest_c;
     }
     return v;
 }
@@ -44,12 +46,26 @@ GaussianFit Astrophysics::fit_gaussian(
     const std::vector<double>& temp_k,
     const std::vector<bool>& hi_window
 ) {
+    std::vector<uint8_t> mask(hi_window.size(), 0);
+    for (size_t i = 0; i < hi_window.size(); ++i) {
+        mask[i] = hi_window[i] ? 1 : 0;
+    }
+    return fit_gaussian(vel_kms, temp_k, mask);
+}
+
+GaussianFit Astrophysics::fit_gaussian(
+    const std::vector<double>& vel_kms,
+    const std::vector<double>& temp_k,
+    const std::vector<uint8_t>& hi_window
+) {
     GaussianFit res;
     size_t n_all = vel_kms.size();
     res.fitted_curve.assign(n_all, 0.0);
 
     // Extract subset inside HI window
     std::vector<double> v_sub, t_sub;
+    v_sub.reserve(n_all);
+    t_sub.reserve(n_all);
     for (size_t i = 0; i < n_all; ++i) {
         if (hi_window[i]) {
             v_sub.push_back(vel_kms[i]);
@@ -106,9 +122,10 @@ GaussianFit Astrophysics::fit_gaussian(
 
     auto eval_chi2 = [&](double cur_a, double cur_v0, double cur_sig) {
         double sum_sq = 0.0;
+        const double neg_half_inv_sig2 = -0.5 / (cur_sig * cur_sig);
         for (size_t i = 0; i < m; ++i) {
             double diff = v_sub[i] - cur_v0;
-            double model = cur_a * std::exp(-0.5 * (diff * diff) / (cur_sig * cur_sig));
+            double model = cur_a * std::exp(neg_half_inv_sig2 * diff * diff);
             double r = t_sub[i] - model;
             sum_sq += r * r;
         }
@@ -123,38 +140,40 @@ GaussianFit Astrophysics::fit_gaussian(
     int successful_steps = 0;
 
     for (int iter = 0; iter < 100; ++iter) {
-        double JTJ[3][3] = {{0}};
-        double JTr[3] = {0};
+        double j00 = 0.0, j01 = 0.0, j02 = 0.0, j11 = 0.0, j12 = 0.0, j22 = 0.0;
+        double g0 = 0.0, g1 = 0.0, g2 = 0.0;
+
+        const double inv_sig = 1.0 / sigma;
+        const double inv_sig2 = inv_sig * inv_sig;
+        const double inv_sig3 = inv_sig2 * inv_sig;
+        const double neg_half_inv_sig2 = -0.5 * inv_sig2;
 
         for (size_t i = 0; i < m; ++i) {
             double diff = v_sub[i] - v0;
-            double sig2 = sigma * sigma;
-            double exp_val = std::exp(-0.5 * (diff * diff) / sig2);
-            double model = a * exp_val;
-            double r = t_sub[i] - model;
+            double diff2 = diff * diff;
+            double exp_val = std::exp(neg_half_inv_sig2 * diff2);
+            double r = t_sub[i] - a * exp_val;
 
-            // Partial derivatives
-            double d_a = exp_val;
-            double d_v0 = a * (diff / sig2) * exp_val;
-            double d_sig = a * (diff * diff) / (sig2 * sigma) * exp_val;
+            double d0 = exp_val;
+            double d1 = a * diff * inv_sig2 * exp_val;
+            double d2 = a * diff2 * inv_sig3 * exp_val;
 
-            double J[3] = {d_a, d_v0, d_sig};
-            for (int r_idx = 0; r_idx < 3; ++r_idx) {
-                JTr[r_idx] += J[r_idx] * r;
-                for (int c_idx = 0; c_idx < 3; ++c_idx) {
-                    JTJ[r_idx][c_idx] += J[r_idx] * J[c_idx];
-                }
-            }
+            g0 += d0 * r;
+            g1 += d1 * r;
+            g2 += d2 * r;
+            j00 += d0 * d0;
+            j01 += d0 * d1;
+            j02 += d0 * d2;
+            j11 += d1 * d1;
+            j12 += d1 * d2;
+            j22 += d2 * d2;
         }
 
-        // Apply damping: JTJ + lambda * diag(JTJ)
-        double A_damped[3][3];
-        for (int r_idx = 0; r_idx < 3; ++r_idx) {
-            for (int c_idx = 0; c_idx < 3; ++c_idx) {
-                A_damped[r_idx][c_idx] = JTJ[r_idx][c_idx];
-            }
-            A_damped[r_idx][r_idx] += lambda * (JTJ[r_idx][r_idx] + 1e-3);
-        }
+        double A_damped[3][3] = {
+            { j00 + lambda * (j00 + 1e-3), j01, j02 },
+            { j01, j11 + lambda * (j11 + 1e-3), j12 },
+            { j02, j12, j22 + lambda * (j22 + 1e-3) }
+        };
 
         double inv_A[3][3];
         if (!invert_3x3(A_damped, inv_A)) {
@@ -162,12 +181,11 @@ GaussianFit Astrophysics::fit_gaussian(
             continue;
         }
 
-        double delta[3] = {0};
-        for (int r_idx = 0; r_idx < 3; ++r_idx) {
-            for (int c_idx = 0; c_idx < 3; ++c_idx) {
-                delta[r_idx] += inv_A[r_idx][c_idx] * JTr[c_idx];
-            }
-        }
+        double delta[3] = {
+            inv_A[0][0] * g0 + inv_A[0][1] * g1 + inv_A[0][2] * g2,
+            inv_A[1][0] * g0 + inv_A[1][1] * g1 + inv_A[1][2] * g2,
+            inv_A[2][0] * g0 + inv_A[2][1] * g1 + inv_A[2][2] * g2
+        };
 
         // Trust-region step limiter to maintain numerical stability across disparate parameter scales
         double step_scale = 1.0;
@@ -213,10 +231,10 @@ GaussianFit Astrophysics::fit_gaussian(
         res.sigma_kms = std::abs(sigma);
         res.fwhm_kms = GAUSSIAN_SIGMA_TO_FWHM * res.sigma_kms;
 
-        // Evaluate full curve
+        const double neg_half_inv_sig2 = -0.5 / (sigma * sigma);
         for (size_t i = 0; i < n_all; ++i) {
             double diff = vel_kms[i] - v0;
-            res.fitted_curve[i] = a * std::exp(-0.5 * (diff * diff) / (sigma * sigma));
+            res.fitted_curve[i] = a * std::exp(neg_half_inv_sig2 * diff * diff);
         }
     } else {
         // Graceful non-parametric fallback
@@ -227,8 +245,6 @@ GaussianFit Astrophysics::fit_gaussian(
         res.fwhm_kms = fwhm_init;
         std::fill(res.fitted_curve.begin(), res.fitted_curve.end(), 0.0);
     }
-
-    return res;
 
     return res;
 }
@@ -245,11 +261,11 @@ AstrophysicalMetrics Astrophysics::calculate_metrics(
     if (nfft == 0) return m;
 
     double hi_half_mhz = config.hi_protection_half_width_khz / 1e3;
-    std::vector<bool> hi_window(nfft, false);
+    std::vector<uint8_t> hi_window(nfft, 0);
     for (int i = 0; i < nfft; ++i) {
         if (freqs_mhz[i] >= (HYDROGEN_REST_FREQ_MHZ - hi_half_mhz) &&
             freqs_mhz[i] <= (HYDROGEN_REST_FREQ_MHZ + hi_half_mhz)) {
-            hi_window[i] = true;
+            hi_window[i] = 1;
         }
     }
 

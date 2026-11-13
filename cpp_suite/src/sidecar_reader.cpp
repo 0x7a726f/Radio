@@ -4,6 +4,9 @@
 #include <iostream>
 #include <regex>
 #include <algorithm>
+#include <unordered_set>
+#include <cctype>
+#include <cstdlib>
 
 namespace astro {
 
@@ -14,34 +17,54 @@ static std::string trim(const std::string& str) {
     return str.substr(start, end - start + 1);
 }
 
-// Simple robust JSON extractor for key-values
-static bool json_extract_number(const std::string& content, const std::string& key, double& out_val) {
-    std::regex rgx("\"" + key + "\"\\s*:\\s*([-+]?[0-9]*\\.?[0-9]+(?:[eE][-+]?[0-9]+)?)");
-    std::smatch match;
-    if (std::regex_search(content, match, rgx)) {
-        try {
-            out_val = std::stod(match[1].str());
-            return true;
-        } catch (...) {}
+// Fast JSON key-value scanner avoiding repeated std::regex compilations
+static size_t find_json_value_start(const std::string& content, const std::string& key) {
+    const std::string needle = "\"" + key + "\"";
+    size_t pos = 0;
+    while ((pos = content.find(needle, pos)) != std::string::npos) {
+        size_t p = pos + needle.size();
+        while (p < content.size() && std::isspace(static_cast<unsigned char>(content[p]))) ++p;
+        if (p < content.size() && content[p] == ':') {
+            ++p;
+            while (p < content.size() && std::isspace(static_cast<unsigned char>(content[p]))) ++p;
+            return p;
+        }
+        pos = p;
     }
-    return false;
+    return std::string::npos;
 }
 
-static bool json_extract_string(const std::string& content, const std::string& key, std::string& out_str) {
-    std::regex rgx("\"" + key + "\"\\s*:\\s*\"([^\"]*)\"");
-    std::smatch match;
-    if (std::regex_search(content, match, rgx)) {
-        out_str = match[1].str();
+static bool json_extract_number(const std::string& content, const std::string& key, double& out_val) {
+    size_t p = find_json_value_start(content, key);
+    if (p == std::string::npos || p >= content.size()) return false;
+    const char* start = content.c_str() + p;
+    char* end = nullptr;
+    double val = std::strtod(start, &end);
+    if (end != start) {
+        out_val = val;
         return true;
     }
     return false;
 }
 
+static bool json_extract_string(const std::string& content, const std::string& key, std::string& out_str) {
+    size_t p = find_json_value_start(content, key);
+    if (p == std::string::npos || p >= content.size() || content[p] != '"') return false;
+    size_t close = content.find('"', p + 1);
+    if (close == std::string::npos) return false;
+    out_str = content.substr(p + 1, close - (p + 1));
+    return true;
+}
+
 static bool json_extract_bool(const std::string& content, const std::string& key, bool& out_bool) {
-    std::regex rgx("\"" + key + "\"\\s*:\\s*(true|false)");
-    std::smatch match;
-    if (std::regex_search(content, match, rgx)) {
-        out_bool = (match[1].str() == "true");
+    size_t p = find_json_value_start(content, key);
+    if (p == std::string::npos || p >= content.size()) return false;
+    if (content.compare(p, 4, "true") == 0) {
+        out_bool = true;
+        return true;
+    }
+    if (content.compare(p, 5, "false") == 0) {
+        out_bool = false;
         return true;
     }
     return false;
@@ -158,8 +181,8 @@ bool SidecarReader::parse_txt_sidecar(const std::string& txt_path, ObservationMe
 bool SidecarReader::parse_filename_fallback(const std::string& cs16_path, ObservationMetadata& meta) {
     std::string fname = std::filesystem::path(cs16_path).filename().string();
     // Pattern example: 2026-11-11_17-47-26_2400000SPS_1420410000Hz.cs16
-    std::regex rate_regex("([0-9]+)SPS", std::regex::icase);
-    std::regex freq_regex("([0-9]+)Hz", std::regex::icase);
+    static const std::regex rate_regex("([0-9]+)SPS", std::regex::icase);
+    static const std::regex freq_regex("([0-9]+)Hz", std::regex::icase);
 
     std::smatch match;
     bool found = false;
@@ -219,7 +242,13 @@ bool SidecarReader::apply_to_config(const ObservationMetadata& meta, AstroConfig
 }
 
 std::vector<std::string> SidecarReader::scan_cs16_files(const std::vector<std::string>& search_paths) {
-    std::vector<std::string> results;
+    struct FoundEntry {
+        std::string path;
+        std::filesystem::file_time_type mtime;
+    };
+    std::vector<FoundEntry> entries;
+    std::unordered_set<std::string> seen_canonical;
+
     for (const auto& path_str : search_paths) {
         std::error_code ec;
         if (!std::filesystem::exists(path_str, ec)) continue;
@@ -228,22 +257,34 @@ std::vector<std::string> SidecarReader::scan_cs16_files(const std::vector<std::s
             for (const auto& entry : std::filesystem::recursive_directory_iterator(path_str, std::filesystem::directory_options::skip_permission_denied, ec)) {
                 if (ec) break;
                 if (entry.is_regular_file(ec) && entry.path().extension() == ".cs16") {
-                    results.push_back(std::filesystem::absolute(entry.path()).string());
+                    std::error_code canon_ec;
+                    auto canon = std::filesystem::weakly_canonical(entry.path(), canon_ec);
+                    std::string canon_key = (canon_ec ? std::filesystem::absolute(entry.path()) : canon).generic_string();
+#ifdef _WIN32
+                    std::transform(canon_key.begin(), canon_key.end(), canon_key.begin(),
+                                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+#endif
+                    if (seen_canonical.insert(std::move(canon_key)).second) {
+                        std::error_code time_ec;
+                        auto mtime = entry.last_write_time(time_ec);
+                        std::string abs_path = std::filesystem::absolute(entry.path(), canon_ec).string();
+                        entries.push_back({std::move(abs_path), mtime});
+                    }
                 }
             }
         } catch (...) {}
     }
 
-    // Sort by last modified time (newest first)
-    std::sort(results.begin(), results.end(), [](const std::string& a, const std::string& b) {
-        std::error_code ec1, ec2;
-        auto time_a = std::filesystem::last_write_time(a, ec1);
-        auto time_b = std::filesystem::last_write_time(b, ec2);
-        return time_a > time_b;
+    // Sort by cached last modified time (newest first)
+    std::sort(entries.begin(), entries.end(), [](const FoundEntry& a, const FoundEntry& b) {
+        return a.mtime > b.mtime;
     });
 
-    // Deduplicate
-    results.erase(std::unique(results.begin(), results.end()), results.end());
+    std::vector<std::string> results;
+    results.reserve(entries.size());
+    for (auto& e : entries) {
+        results.push_back(std::move(e.path));
+    }
     return results;
 }
 
